@@ -33,6 +33,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.quantization.fake_mx import maybe_fake_mx_quantize_attention_qkv
 from vllm_ascend.utils import is_310p
 
 _GDN_PATCH_TARGET = _GDNBaseCls
@@ -78,6 +79,7 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
             q, k = self.rotary_emb(positions, q, k)
 
+        q, k, v = maybe_fake_mx_quantize_attention_qkv(self.qkv_proj, q, k, v)
         attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
