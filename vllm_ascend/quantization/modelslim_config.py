@@ -25,6 +25,7 @@ import glob
 import json
 import os
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import Any, Optional
 
@@ -65,6 +66,48 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 
 # The config filename that ModelSlim generates after quantizing a model.
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
+FAKE_MX_QUANT_TYPES = frozenset(
+    {
+        "W4A4_MXFP4_FAKE",
+        "W8A8_MXFP8_FAKE",
+        "W4A4_MXFP4_FLATQUANT_FAKE",
+        "W8A8_MXFP8_FLATQUANT_FAKE",
+        "W4A4_MXFP4_OMNIQUANT_FAKE",
+        "W8A8_MXFP8_OMNIQUANT_FAKE",
+        "W4A4_MXFP4_RHT_FAKE",
+        "W8A8_MXFP8_RHT_FAKE",
+        "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+        "W8A8_MXFP8_HADAMARD_LEARNING_FAKE",
+        "W4A4_MXFP4_AUTOROUND_FAKE",
+        "W8A8_MXFP8_AUTOROUND_FAKE",
+    }
+)
+
+
+def _get_fake_mx_quant_type(quant_description: Mapping[str, Any], prefix: str) -> str | None:
+    """Resolve an optional fake-MX default or glob override for a module."""
+    overrides = quant_description.get("module_quant_overrides", {})
+    if overrides:
+        if not isinstance(overrides, Mapping):
+            raise TypeError("module_quant_overrides must be a mapping of glob pattern to quant type.")
+        for pattern, quant_type in overrides.items():
+            if fnmatchcase(prefix, pattern) or fnmatchcase(f"{prefix}.weight", pattern):
+                if quant_type not in FAKE_MX_QUANT_TYPES and quant_type != "FLOAT":
+                    raise ValueError(
+                        f"Unsupported fake-MX override {quant_type!r} for pattern {pattern!r}. "
+                        f"Expected one of {sorted(FAKE_MX_QUANT_TYPES)} or 'FLOAT'."
+                    )
+                return quant_type
+
+    default_quant_type = quant_description.get("default_quant_type")
+    if default_quant_type is None:
+        return None
+    if default_quant_type not in FAKE_MX_QUANT_TYPES:
+        raise ValueError(
+            f"default_quant_type only supports fake-MX types {sorted(FAKE_MX_QUANT_TYPES)}, "
+            f"got {default_quant_type!r}."
+        )
+    return default_quant_type
 
 # key: model_type
 # value: dict of fused module name -> list of original module names
@@ -360,10 +403,16 @@ def get_linear_quant_type(
     """
     proj_name = prefix.split(".")[-1]
     if proj_name in packed_modules_mapping:
-        quant_type = None
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name) for shard_proj_name in packed_modules_mapping[proj_name]
         ]
+        shard_keys = [shard_prefix + ".weight" for shard_prefix in shard_prefixes]
+        if not any(shard_key in quant_description for shard_key in shard_keys):
+            fake_quant_type = _get_fake_mx_quant_type(quant_description, prefix)
+            if fake_quant_type is not None:
+                return fake_quant_type
+
+        quant_type = None
         for shard_prefix in shard_prefixes:
             shard_quant_type = quant_description[shard_prefix + ".weight"]
 
@@ -378,7 +427,14 @@ def get_linear_quant_type(
                 logger.error(err_msg)
                 raise ValueError(err_msg)
     else:
-        quant_type = quant_description[prefix + ".weight"]
+        weight_key = prefix + ".weight"
+        if weight_key in quant_description:
+            quant_type = quant_description[weight_key]
+        else:
+            quant_type = _get_fake_mx_quant_type(quant_description, prefix)
+            if quant_type is None:
+                # Preserve the existing error for malformed ModelSlim configs.
+                quant_type = quant_description[weight_key]
     return quant_type
 
 
@@ -681,6 +737,20 @@ class AscendModelSlimConfig(QuantizationConfig):
     def is_layer_skipped_ascend(self, prefix: str, fused_mapping: Mapping[str, list[str]] = MappingProxyType({})):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        fake_quant_type = _get_fake_mx_quant_type(self.quant_description, prefix)
+        if fake_quant_type is not None:
+            if proj_name not in fused_mapping and f"{prefix}.weight" in self.quant_description:
+                return self.quant_description[f"{prefix}.weight"] == "FLOAT"
+            if proj_name in fused_mapping:
+                shard_keys = [
+                    f"{prefix.replace(proj_name, shard_proj_name)}.weight"
+                    for shard_proj_name in fused_mapping[proj_name]
+                ]
+                if not any(shard_key in self.quant_description for shard_key in shard_keys):
+                    return fake_quant_type == "FLOAT"
+            else:
+                return fake_quant_type == "FLOAT"
+
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name) for shard_proj_name in fused_mapping[proj_name]
