@@ -445,16 +445,18 @@ class _AscendLACFakeMXLinearMethod(_AscendFakeMXLinearMethod):
         }
 
     def transform_activation(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if not getattr(layer, "_lac_has_params", False):
+            return x
         clip_factor_min = layer.clip_factor_min.data.to(x.device, dtype=torch.float32)
         clip_factor_max = layer.clip_factor_max.data.to(x.device, dtype=torch.float32)
         maxval = layer.maxval.data.to(x.device, dtype=torch.float32)
         minval = layer.minval.data.to(x.device, dtype=torch.float32)
         if not getattr(layer, "_lac_range_computed", False):
             if maxval.item() == 0:
-                maxval = x.to(torch.float32).amax()
+                maxval = x.to(torch.float32).amax().clamp(min=1e-5)
                 layer.maxval.data.copy_(maxval.to(layer.maxval.dtype))
             if minval.item() == 0:
-                minval = x.to(torch.float32).amin()
+                minval = x.to(torch.float32).amin().clamp(max=-1e-5)
                 layer.minval.data.copy_(minval.to(layer.minval.dtype))
             layer._lac_range_computed = True
         cur_max = maxval * torch.sigmoid(clip_factor_max)
@@ -464,10 +466,11 @@ class _AscendLACFakeMXLinearMethod(_AscendFakeMXLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_lac_processed", False):
             params = _load_transform_params(self.params_path)
-            _copy_transform_param(layer.clip_factor_min.data, params, layer, "clip_factor_min", required=False)
-            _copy_transform_param(layer.clip_factor_max.data, params, layer, "clip_factor_max", required=False)
+            loaded_min = _copy_transform_param(layer.clip_factor_min.data, params, layer, "clip_factor_min", required=False)
+            loaded_max = _copy_transform_param(layer.clip_factor_max.data, params, layer, "clip_factor_max", required=False)
             _copy_transform_param(layer.maxval.data, params, layer, "maxval", required=False)
             _copy_transform_param(layer.minval.data, params, layer, "minval", required=False)
+            layer._lac_has_params = loaded_min is not None or loaded_max is not None
             layer._fake_mx_lac_processed = True
         layer.clip_factor_min = torch.nn.Parameter(layer.clip_factor_min.data.contiguous(), requires_grad=False)
         layer.clip_factor_max = torch.nn.Parameter(layer.clip_factor_max.data.contiguous(), requires_grad=False)
@@ -585,7 +588,7 @@ class _AscendHadamardLearningFakeMXLinearMethod(_AscendFakeMXLinearMethod):
         return {
             "transform_weight": torch.eye(
                 self.matrix_size,
-                dtype=params_dtype,
+                dtype=torch.float32,
             )
         }
 
@@ -607,10 +610,9 @@ class _AscendHadamardLearningFakeMXLinearMethod(_AscendFakeMXLinearMethod):
                 "transform_weight",
             )
             logger.debug("LHT: loaded %s", key)
-            inverse_transpose = _inverse_fp32(layer.transform_weight.data, transpose=True)
             original_shape = layer.weight.data.shape
             weight_blocked = layer.weight.data.to(torch.float32).reshape(-1, self.matrix_size)
-            rotated = weight_blocked @ inverse_transpose
+            rotated = weight_blocked @ layer.transform_weight.data.to(torch.float32)
             layer.weight.data.copy_(rotated.reshape(original_shape).to(layer.weight.data.dtype))
             layer._fake_mx_lht_weight_transformed = True
         layer.transform_weight = torch.nn.Parameter(
@@ -683,8 +685,8 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
         else:
             left_trans_dim, right_trans_dim = _get_decompose_dim(self.input_size, 1)
         return {
-            "left_trans": torch.eye(left_trans_dim, dtype=params_dtype),
-            "right_trans": torch.eye(right_trans_dim, dtype=params_dtype),
+            "left_trans": torch.eye(left_trans_dim, dtype=torch.float32),
+            "right_trans": torch.eye(right_trans_dim, dtype=torch.float32),
             "clip_ratio": torch.ones(1, dtype=torch.float32),
             "diag_scale": torch.ones(self.input_size, dtype=torch.float32),
         }
@@ -706,10 +708,10 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
             )
 
         reshaped = x.reshape(-1, left_dim, right_dim)
+        if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
+            reshaped = reshaped * layer.diag_scale.to(x.dtype).reshape(1, left_dim, right_dim)
         transformed = torch.matmul(layer.left_trans.to(x.dtype).transpose(0, 1), reshaped)
         transformed = torch.matmul(transformed, layer.right_trans.to(x.dtype))
-        if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
-            transformed = transformed * layer.diag_scale.to(x.dtype).reshape(1, left_dim, right_dim)
         transformed = transformed.reshape(*input_shape)
         quantized_x = fake_mx_quantize(
             transformed,
@@ -741,11 +743,15 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
             inv_right_t = _inverse_fp32(layer.right_trans.data, transpose=True)
             original_shape = layer.weight.data.shape
             weight_blocked = layer.weight.data.to(torch.float32).reshape(-1, left_dim, right_dim)
-            rotated = torch.matmul(inv_left, weight_blocked)
-            rotated = torch.matmul(rotated, inv_right_t)
             if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
                 diag = layer.diag_scale.data.to(torch.float32).reshape(left_dim, right_dim)
-                rotated = rotated / diag.unsqueeze(0).clamp(min=1e-8)
+                if not torch.isfinite(diag).all():
+                    raise ValueError("FlatQuant diag_scale contains NaN or Inf.")
+                if torch.any(diag.abs() < 1e-8):
+                    raise ValueError("FlatQuant diag_scale contains near-zero values.")
+                weight_blocked = weight_blocked / diag.unsqueeze(0)
+            rotated = torch.matmul(inv_left, weight_blocked)
+            rotated = torch.matmul(rotated, inv_right_t)
             layer.weight.data.copy_(rotated.reshape(original_shape).to(layer.weight.data.dtype))
             layer._fake_mx_flatquant_weight_transformed = True
         if isinstance(layer, RowParallelLinear):

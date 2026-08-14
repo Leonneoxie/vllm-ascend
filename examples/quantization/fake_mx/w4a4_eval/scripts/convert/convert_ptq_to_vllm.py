@@ -152,7 +152,7 @@ def convert_flatquant_mlp(ptq_dir, model_dir, output_path):
         ptq = load_ptq_params(ptq_dir, layer_idx, "mlp")
         if not ptq:
             continue
-        params = ptq["mlp"]
+        params = _flatten_ptq_params(ptq["mlp"])
         input_left = params["input_transform.transform.linear_left.weight"]
         input_right = params["input_transform.transform.linear_right.weight"]
         input_diag = params.get("input_transform.transform.diag_scale")
@@ -189,19 +189,33 @@ def convert_flatquant_mlp(ptq_dir, model_dir, output_path):
 
 
 def _process_flatquant_proj(original_weights, output_tensors, layer_idx, proj_path, left, right, diag):
+    """Output FlatQuant transform matrices in vllm-ascend fused-projection naming.
+
+    vllm-ascend loads left_trans/right_trans/diag_scale at runtime and applies
+    the weight inverse transform itself, so we do NOT output pre-transformed
+    .weight tensors here.
+    """
     prefix = f"model.language_model.layers.{layer_idx}.{proj_path}"
-    key = f"{prefix}.weight"
-    if key not in original_weights:
-        print(f"  WARNING: {key} not found")
-        return
-    w = original_weights[key]
-    transformed_w = apply_flatquant_transform(w, left, right, diag)
-    output_tensors[key] = transformed_w.to(torch.bfloat16)
-    output_tensors[f"{prefix}.left_trans"] = left.to(torch.bfloat16).clone()
-    output_tensors[f"{prefix}.right_trans"] = right.to(torch.bfloat16).clone()
-    output_tensors[f"{prefix}.clip_ratio"] = torch.ones(1, dtype=torch.float32)
+    output_tensors[f"{prefix}.left_trans"] = left.to(torch.float32).clone()
+    output_tensors[f"{prefix}.right_trans"] = right.to(torch.float32).clone()
     if diag is not None:
         output_tensors[f"{prefix}.diag_scale"] = diag.to(torch.float32).clone()
+
+
+def _extract_lht_transform_weight(params, transform_name="input_transform"):
+    """Extract LHT transform_weight from AMCT params, supporting multiple key formats."""
+    key = f"{transform_name}.transform.linear.weight"
+    if key in params:
+        return params[key]
+    if f"{transform_name}.transform_weight" in params:
+        return params[f"{transform_name}.transform_weight"]
+    if transform_name in params and isinstance(params[transform_name], dict):
+        sub = params[transform_name]
+        if "transform_weight" in sub:
+            return sub["transform_weight"]
+        if "transform" in sub and isinstance(sub["transform"], dict) and "linear" in sub["transform"]:
+            return sub["transform"]["linear"]["weight"]
+    return None
 
 
 def convert_lht_attn(ptq_dir, output_path):
@@ -212,17 +226,19 @@ def convert_lht_attn(ptq_dir, output_path):
         if not ptq:
             continue
         for unit_name, params in ptq.items():
-            input_tw = params["input_transform.transform_weight"]
-            out_tw = params["out_transform.transform_weight"]
+            input_tw = _extract_lht_transform_weight(params, "input_transform")
+            out_tw = _extract_lht_transform_weight(params, "out_transform")
+            if input_tw is None or out_tw is None:
+                continue
             if unit_name == "self_attn":
                 prefix = f"model.language_model.layers.{layer_idx}.self_attn"
-                output_tensors[f"{prefix}.qkv_proj.transform_weight"] = input_tw.to(torch.bfloat16)
-                output_tensors[f"{prefix}.o_proj.transform_weight"] = out_tw.to(torch.bfloat16)
+                output_tensors[f"{prefix}.qkv_proj.transform_weight"] = input_tw.to(torch.float32)
+                output_tensors[f"{prefix}.o_proj.transform_weight"] = out_tw.to(torch.float32)
             elif unit_name == "linear_attn":
                 prefix = f"model.language_model.layers.{layer_idx}.linear_attn"
-                output_tensors[f"{prefix}.in_proj_qkvz.transform_weight"] = input_tw.to(torch.bfloat16)
-                output_tensors[f"{prefix}.in_proj_ba.transform_weight"] = input_tw.to(torch.bfloat16).clone()
-                output_tensors[f"{prefix}.out_proj.transform_weight"] = out_tw.to(torch.bfloat16)
+                output_tensors[f"{prefix}.in_proj_qkvz.transform_weight"] = input_tw.to(torch.float32)
+                output_tensors[f"{prefix}.in_proj_ba.transform_weight"] = input_tw.to(torch.float32).clone()
+                output_tensors[f"{prefix}.out_proj.transform_weight"] = out_tw.to(torch.float32)
     save_file(output_tensors, output_path)
     print(f"Saved {len(output_tensors)} tensors to {output_path}")
 
@@ -235,15 +251,17 @@ def convert_lht_mlp(ptq_dir, output_path):
         if not ptq:
             continue
         params = ptq["mlp"]
-        input_tw = params["input_transform.transform_weight"]
-        hidden_tw = params["hidden_transform.transform_weight"]
+        input_tw = _extract_lht_transform_weight(params, "input_transform")
+        hidden_tw = _extract_lht_transform_weight(params, "hidden_transform")
+        if input_tw is None or hidden_tw is None:
+            continue
         for proj, tw in [
             ("gate_proj", input_tw.clone()),
             ("up_proj", input_tw.clone()),
             ("down_proj", hidden_tw.clone()),
         ]:
             prefix = f"model.language_model.layers.{layer_idx}.mlp.{proj}"
-            output_tensors[f"{prefix}.transform_weight"] = tw.to(torch.bfloat16)
+            output_tensors[f"{prefix}.transform_weight"] = tw.to(torch.float32)
     save_file(output_tensors, output_path)
     print(f"Saved {len(output_tensors)} tensors to {output_path}")
 

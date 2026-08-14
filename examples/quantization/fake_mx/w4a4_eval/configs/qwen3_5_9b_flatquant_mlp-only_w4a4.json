@@ -3,7 +3,7 @@
   "fake_mx_quant_targets": [
     "attn-linear"
   ],
-  "flatquant_params_path": "../Qwen3.5-9B-flatquant-mlp-params/flatquant_mlp_params.safetensors",
+  "flatquant_params_path": "flatquant_params.safetensors",
   "group_size": 32,
   "max_supported_tp": 4,
   "module_quant_overrides": {
