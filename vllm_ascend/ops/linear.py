@@ -81,9 +81,23 @@ def _should_keep_nd_for_310p_weight(weight: torch.Tensor) -> bool:
 
 
 class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
-    """Linear method without quantization"""
+    """Linear method without quantization.
+
+    In intrusive audit mode, delegates to an
+    :class:`IntrusiveLinearAdapter` that independently applies the same
+    Fake-MX transform + QDQ as the ModelSlim Scheme, providing A/B
+    verification without instantiating any Scheme.
+    """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm_ascend.quantization.intrusive import maybe_create_intrusive_linear_adapter
+
+        adapter = maybe_create_intrusive_linear_adapter(layer)
+        if adapter is not None:
+            adapter.process_weight(layer)
+            layer._fake_mx_intrusive_adapter = adapter
+            return
+
         super().process_weights_after_loading(layer)
         keep_nd_weight = _should_keep_nd_for_310p_weight(layer.weight.data)
         # must use fp32 to avoid accuracy degradation in dsv4.
@@ -103,6 +117,9 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        adapter = getattr(layer, "_fake_mx_intrusive_adapter", None)
+        if adapter is not None:
+            return adapter.apply(layer, x, bias)
         return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
 
 

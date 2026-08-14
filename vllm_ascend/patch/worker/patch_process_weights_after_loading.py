@@ -51,6 +51,12 @@ def ascend_process_weights_after_loading(
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
 
+    # Verify that intrusive audit mode selected at least one node.
+    # Called after all weights are processed so _selected_prefixes is fully populated.
+    from vllm_ascend.quantization.fake_mx_audit import assert_selected_count
+
+    assert_selected_count()
+
 
 utils.process_weights_after_loading = ascend_process_weights_after_loading
 base_loader.process_weights_after_loading = ascend_process_weights_after_loading

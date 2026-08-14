@@ -33,10 +33,16 @@ from vllm_ascend.quantization.fake_mx import (
     learned_hadamard_transform,
     randomized_hadamard_transform,
 )
+from vllm_ascend.quantization.fake_mx_audit import (
+    audit_call,
+    audit_enabled,
+    audit_event,
+    make_context,
+)
 from vllm_ascend.utils import maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
-from .registry import register_scheme
+from .registry import get_quant_type_for_scheme, register_scheme
 
 MAX_FLATQUANT_TRANSFORM_DIM = 256
 DEFAULT_TRANSFORM_MATRIX_SIZE = 128
@@ -140,6 +146,77 @@ def _inverse_fp32(matrix: torch.Tensor, *, transpose: bool = False) -> torch.Ten
     return torch.linalg.solve(source, identity)
 
 
+# ---- Pure transform functions shared by ModelSlim and intrusive paths ----
+
+
+def transform_flatquant_weight(
+    weight: torch.Tensor,
+    left_trans: torch.Tensor,
+    right_trans: torch.Tensor,
+    diag_scale: torch.Tensor | None,
+    left_dim: int,
+    right_dim: int,
+) -> torch.Tensor:
+    """FlatQuant weight inverse transform: W' = inv(left) @ (W / diag) @ inv(right).T.
+
+    Returns the transformed weight in float32 with the original shape.
+    Both ModelSlim Scheme and the intrusive path call this function so
+    that the weight transform math is guaranteed identical.
+    """
+    inv_left = _inverse_fp32(left_trans)
+    inv_right_t = _inverse_fp32(right_trans, transpose=True)
+    original_shape = weight.shape
+    weight_blocked = weight.to(torch.float32).reshape(-1, left_dim, right_dim)
+    if diag_scale is not None:
+        diag = diag_scale.to(torch.float32).reshape(left_dim, right_dim)
+        if not torch.isfinite(diag).all():
+            raise ValueError("FlatQuant diag_scale contains NaN or Inf.")
+        if torch.any(diag.abs() < 1e-8):
+            raise ValueError("FlatQuant diag_scale contains near-zero values.")
+        weight_blocked = weight_blocked / diag.unsqueeze(0)
+    rotated = torch.matmul(inv_left, weight_blocked)
+    rotated = torch.matmul(rotated, inv_right_t)
+    return rotated.reshape(original_shape)
+
+
+def transform_flatquant_activation(
+    x: torch.Tensor,
+    left_trans: torch.Tensor,
+    right_trans: torch.Tensor,
+    diag_scale: torch.Tensor | None,
+    left_dim: int,
+    right_dim: int,
+) -> torch.Tensor:
+    """FlatQuant activation forward transform: x' = left.T @ (reshape(x) * diag) @ right.
+
+    Returns the transformed activation with the original input shape.
+    """
+    input_shape = x.shape
+    reshaped = x.reshape(-1, left_dim, right_dim)
+    if diag_scale is not None:
+        reshaped = reshaped * diag_scale.to(x.dtype).reshape(1, left_dim, right_dim)
+    transformed = torch.matmul(left_trans.to(x.dtype).transpose(0, 1), reshaped)
+    transformed = torch.matmul(transformed, right_trans.to(x.dtype))
+    return transformed.reshape(*input_shape)
+
+
+def transform_lht_weight(
+    weight: torch.Tensor,
+    transform_weight: torch.Tensor,
+    matrix_size: int,
+) -> torch.Tensor:
+    """LHT weight inverse transform: W' = W @ Q (block-wise).
+
+    AMCT exports the orthogonal matrix Q actually used by forward.  Since
+    inv(Q).T == Q for orthogonal matrices, the paired weight transform is
+    also W @ Q — no explicit inverse needed.
+    """
+    original_shape = weight.shape
+    weight_blocked = weight.to(torch.float32).reshape(-1, matrix_size)
+    rotated = weight_blocked @ transform_weight.to(torch.float32)
+    return rotated.reshape(original_shape)
+
+
 def _get_decompose_dim(size: int, tp_size: int) -> tuple[int, int]:
     """Decompose a feature size into FlatQuant Kronecker dimensions."""
     left_candidate = math.isqrt(size)
@@ -206,6 +283,27 @@ class _AscendFakeMXLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
+        if audit_enabled():
+            prefix = getattr(layer, "prefix", "") or ""
+            ctx = make_context(
+                prefix,
+                scheme=self.__class__.__name__,
+                algorithm=self.algorithm,
+                fmt=self.mx_format,
+                group_size=self.group_size,
+            )
+            with audit_call(ctx, kind="act") as call:
+                call.capture("act_raw", x)
+                x = self.transform_activation(layer, x)
+                call.capture("act_transformed", x)
+                audit_event(ctx, "activation_transform", backend="modelslim")
+                quantized_x = fake_mx_quantize(x, self.mx_format, self.group_size)
+                call.capture("act_qdq", quantized_x)
+                audit_event(ctx, "activation_qdq", backend="modelslim")
+                result = F.linear(quantized_x, layer.weight, bias)
+                call.capture("output", result)
+                audit_event(ctx, "linear_output", backend="modelslim")
+            return result
         x = self.transform_activation(layer, x)
         quantized_x = fake_mx_quantize(x, self.mx_format, self.group_size)
         return F.linear(quantized_x, layer.weight, bias)
@@ -213,11 +311,69 @@ class _AscendFakeMXLinearMethod(AscendLinearScheme):
     def transform_activation(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         return x
 
+    def _emit_node_selected(self, layer: torch.nn.Module) -> None:
+        """Emit ``node_selected`` audit event with real quant_type from registry."""
+        if not audit_enabled():
+            return
+        if getattr(layer, "_audit_node_emitted", False):
+            return
+        layer._audit_node_emitted = True
+        prefix = getattr(layer, "prefix", "") or ""
+        quant_type = get_quant_type_for_scheme(self.__class__) or "UNKNOWN"
+        ctx = make_context(
+            prefix,
+            scheme=self.__class__.__name__,
+            algorithm=self.algorithm,
+            fmt=self.mx_format,
+            group_size=self.group_size,
+        )
+        audit_event(
+            ctx,
+            "node_selected",
+            backend="modelslim",
+            quant_type=quant_type,
+            algorithm=self.algorithm,
+            mx_format=self.mx_format,
+            group_size=self.group_size,
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_fake_mx_weight_processed", False):
             return
+        self._emit_node_selected(layer)
         if not self.prequantized_weight:
+            prefix = getattr(layer, "prefix", "") or ""
+            ctx = (
+                make_context(
+                    prefix,
+                    scheme=self.__class__.__name__,
+                    algorithm=self.algorithm,
+                    fmt=self.mx_format,
+                    group_size=self.group_size,
+                )
+                if audit_enabled()
+                else None
+            )
+            # Subclass (FlatQuant/LHT) may have already captured weight_raw
+            # and weight_transformed and left an open weight call context.
+            existing_call = getattr(layer, "_audit_weight_call", None)
+            if existing_call is not None:
+                call = existing_call
+            elif ctx is not None:
+                call = audit_call(ctx, kind="weight")
+                call.__enter__()
+                call.capture("weight_raw", layer.weight.data)
+            else:
+                call = None
             layer.weight.data.copy_(fake_mx_quantize(layer.weight.data, self.mx_format, self.group_size))
+            if call is not None:
+                call.capture("weight_qdq", layer.weight.data)
+                audit_event(ctx, "weight_qdq", backend="modelslim")
+                if existing_call is not None:
+                    call.__exit__(None, None, None)
+                    delattr(layer, "_audit_weight_call")
+                else:
+                    call.__exit__(None, None, None)
         layer._fake_mx_weight_processed = True
 
 
@@ -447,18 +603,12 @@ class _AscendLACFakeMXLinearMethod(_AscendFakeMXLinearMethod):
     def transform_activation(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         if not getattr(layer, "_lac_has_params", False):
             return x
-        clip_factor_min = layer.clip_factor_min.data.to(x.device, dtype=torch.float32)
-        clip_factor_max = layer.clip_factor_max.data.to(x.device, dtype=torch.float32)
         maxval = layer.maxval.data.to(x.device, dtype=torch.float32)
         minval = layer.minval.data.to(x.device, dtype=torch.float32)
-        if not getattr(layer, "_lac_range_computed", False):
-            if maxval.item() == 0:
-                maxval = x.to(torch.float32).amax().clamp(min=1e-5)
-                layer.maxval.data.copy_(maxval.to(layer.maxval.dtype))
-            if minval.item() == 0:
-                minval = x.to(torch.float32).amin().clamp(max=-1e-5)
-                layer.minval.data.copy_(minval.to(layer.minval.dtype))
-            layer._lac_range_computed = True
+        if maxval.item() == 0 or minval.item() == 0:
+            return x
+        clip_factor_min = layer.clip_factor_min.data.to(x.device, dtype=torch.float32)
+        clip_factor_max = layer.clip_factor_max.data.to(x.device, dtype=torch.float32)
         cur_max = maxval * torch.sigmoid(clip_factor_max)
         cur_min = minval * torch.sigmoid(clip_factor_min)
         return torch.clamp(x.to(torch.float32), min=cur_min, max=cur_max).to(x.dtype)
@@ -466,11 +616,17 @@ class _AscendLACFakeMXLinearMethod(_AscendFakeMXLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_lac_processed", False):
             params = _load_transform_params(self.params_path)
-            loaded_min = _copy_transform_param(layer.clip_factor_min.data, params, layer, "clip_factor_min", required=False)
-            loaded_max = _copy_transform_param(layer.clip_factor_max.data, params, layer, "clip_factor_max", required=False)
-            _copy_transform_param(layer.maxval.data, params, layer, "maxval", required=False)
-            _copy_transform_param(layer.minval.data, params, layer, "minval", required=False)
-            layer._lac_has_params = loaded_min is not None or loaded_max is not None
+            loaded_min = _copy_transform_param(
+                layer.clip_factor_min.data, params, layer, "clip_factor_min", required=False
+            )
+            loaded_max = _copy_transform_param(
+                layer.clip_factor_max.data, params, layer, "clip_factor_max", required=False
+            )
+            loaded_maxval = _copy_transform_param(layer.maxval.data, params, layer, "maxval", required=False)
+            loaded_minval = _copy_transform_param(layer.minval.data, params, layer, "minval", required=False)
+            layer._lac_has_params = (loaded_min is not None or loaded_max is not None) and (
+                loaded_maxval is not None or loaded_minval is not None
+            )
             layer._fake_mx_lac_processed = True
         layer.clip_factor_min = torch.nn.Parameter(layer.clip_factor_min.data.contiguous(), requires_grad=False)
         layer.clip_factor_max = torch.nn.Parameter(layer.clip_factor_max.data.contiguous(), requires_grad=False)
@@ -602,19 +758,42 @@ class _AscendHadamardLearningFakeMXLinearMethod(_AscendFakeMXLinearMethod):
                 f"divisible by matrix_size ({self.matrix_size})."
             )
         if not getattr(layer, "_fake_mx_lht_weight_transformed", False):
-            params = _load_transform_params(self.params_path)
-            key = _copy_transform_param(
-                layer.transform_weight.data,
-                params,
-                layer,
-                "transform_weight",
+            self._emit_node_selected(layer)
+            prefix = getattr(layer, "prefix", "") or ""
+            ctx = (
+                make_context(
+                    prefix,
+                    scheme=self.__class__.__name__,
+                    algorithm="hadamard_learning",
+                    fmt=self.mx_format,
+                    group_size=self.group_size,
+                )
+                if audit_enabled()
+                else None
             )
+            call = None
+            if ctx is not None:
+                call = audit_call(ctx, kind="weight")
+                call.__enter__()
+                call.capture("weight_raw", layer.weight.data)
+            params = _load_transform_params(self.params_path)
+            key = _copy_transform_param(layer.transform_weight.data, params, layer, "transform_weight")
             logger.debug("LHT: loaded %s", key)
-            original_shape = layer.weight.data.shape
-            weight_blocked = layer.weight.data.to(torch.float32).reshape(-1, self.matrix_size)
-            rotated = weight_blocked @ layer.transform_weight.data.to(torch.float32)
-            layer.weight.data.copy_(rotated.reshape(original_shape).to(layer.weight.data.dtype))
+            if ctx is not None:
+                audit_event(
+                    ctx,
+                    "lht_params_loaded",
+                    param_key=key,
+                    transform_weight_shape=list(layer.transform_weight.data.shape),
+                )
+            transformed_weight = transform_lht_weight(layer.weight.data, layer.transform_weight.data, self.matrix_size)
+            if call is not None:
+                call.capture("weight_transformed", transformed_weight)
+                audit_event(ctx, "weight_transform", backend="modelslim")
+            layer.weight.data.copy_(transformed_weight.to(layer.weight.data.dtype))
             layer._fake_mx_lht_weight_transformed = True
+            if call is not None:
+                layer._audit_weight_call = call
         layer.transform_weight = torch.nn.Parameter(
             layer.transform_weight.data.contiguous(),
             requires_grad=False,
@@ -641,6 +820,7 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
     """
 
     supports_pertensor_layer_type = True
+    algorithm = "flatquant"
 
     def __init__(self):
         super().__init__()
@@ -698,62 +878,92 @@ class _AscendFakeMXFlatQuantLinearMethod(_AscendFakeMXLinearMethod):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        input_shape = x.shape
         left_dim = layer.left_trans.shape[0]
         right_dim = layer.right_trans.shape[0]
-        if left_dim * right_dim != input_shape[-1]:
+        if left_dim * right_dim != x.shape[-1]:
             raise ValueError(
                 "FlatQuant transform matrices dimension mismatch: "
-                f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({input_shape[-1]})."
+                f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({x.shape[-1]})."
             )
-
-        reshaped = x.reshape(-1, left_dim, right_dim)
-        if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
-            reshaped = reshaped * layer.diag_scale.to(x.dtype).reshape(1, left_dim, right_dim)
-        transformed = torch.matmul(layer.left_trans.to(x.dtype).transpose(0, 1), reshaped)
-        transformed = torch.matmul(transformed, layer.right_trans.to(x.dtype))
-        transformed = transformed.reshape(*input_shape)
-        quantized_x = fake_mx_quantize(
-            transformed,
-            self.mx_format,
-            self.group_size,
-            clip_ratio=layer.aclnn_clip_ratio,
-        )
+        diag = layer.diag_scale if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+        if audit_enabled():
+            prefix = getattr(layer, "prefix", "") or ""
+            ctx = make_context(
+                prefix,
+                scheme=self.__class__.__name__,
+                algorithm="flatquant",
+                fmt=self.mx_format,
+                group_size=self.group_size,
+            )
+            with audit_call(ctx, kind="act") as call:
+                call.capture("act_raw", x)
+                transformed = transform_flatquant_activation(
+                    x, layer.left_trans, layer.right_trans, diag, left_dim, right_dim
+                )
+                call.capture("act_transformed", transformed)
+                audit_event(ctx, "activation_transform", backend="modelslim")
+                quantized_x = fake_mx_quantize(
+                    transformed, self.mx_format, self.group_size, clip_ratio=layer.aclnn_clip_ratio
+                )
+                call.capture("act_qdq", quantized_x)
+                audit_event(ctx, "activation_qdq", backend="modelslim")
+                result = F.linear(quantized_x, layer.weight, bias)
+                call.capture("output", result)
+                audit_event(ctx, "linear_output", backend="modelslim")
+            return result
+        transformed = transform_flatquant_activation(x, layer.left_trans, layer.right_trans, diag, left_dim, right_dim)
+        quantized_x = fake_mx_quantize(transformed, self.mx_format, self.group_size, clip_ratio=layer.aclnn_clip_ratio)
         return F.linear(quantized_x, layer.weight, bias)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not getattr(layer, "_fake_mx_flatquant_weight_transformed", False):
+            self._emit_node_selected(layer)
             ext_params = self._load_external_params()
             layer_prefix = getattr(layer, "prefix", "") or ""
+            ctx = (
+                make_context(
+                    layer_prefix,
+                    scheme=self.__class__.__name__,
+                    algorithm="flatquant",
+                    fmt=self.mx_format,
+                    group_size=self.group_size,
+                )
+                if audit_enabled()
+                else None
+            )
+            call = None
+            if ctx is not None:
+                call = audit_call(ctx, kind="weight")
+                call.__enter__()
+                call.capture("weight_raw", layer.weight.data)
             left_key = _copy_transform_param(layer.left_trans.data, ext_params, layer, "left_trans")
             _copy_transform_param(layer.right_trans.data, ext_params, layer, "right_trans")
-            _copy_transform_param(
-                layer.diag_scale.data,
-                ext_params,
-                layer,
-                "diag_scale",
-                required=self.use_diag_scale,
-            )
+            _copy_transform_param(layer.diag_scale.data, ext_params, layer, "diag_scale", required=self.use_diag_scale)
             layer.clip_ratio.data.fill_(1.0)
             logger.debug("FlatQuant: loaded %s for %s", left_key, layer_prefix)
+            if ctx is not None:
+                audit_event(
+                    ctx,
+                    "flatquant_params_loaded",
+                    left_key=left_key,
+                    left_trans_shape=list(layer.left_trans.data.shape),
+                    right_trans_shape=list(layer.right_trans.data.shape),
+                )
             left_dim = layer.left_trans.data.shape[0]
             right_dim = layer.right_trans.data.shape[0]
-            # AMCT weight transform: W' = inv(left) @ W @ inv(right).T
-            inv_left = _inverse_fp32(layer.left_trans.data)
-            inv_right_t = _inverse_fp32(layer.right_trans.data, transpose=True)
-            original_shape = layer.weight.data.shape
-            weight_blocked = layer.weight.data.to(torch.float32).reshape(-1, left_dim, right_dim)
-            if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
-                diag = layer.diag_scale.data.to(torch.float32).reshape(left_dim, right_dim)
-                if not torch.isfinite(diag).all():
-                    raise ValueError("FlatQuant diag_scale contains NaN or Inf.")
-                if torch.any(diag.abs() < 1e-8):
-                    raise ValueError("FlatQuant diag_scale contains near-zero values.")
-                weight_blocked = weight_blocked / diag.unsqueeze(0)
-            rotated = torch.matmul(inv_left, weight_blocked)
-            rotated = torch.matmul(rotated, inv_right_t)
-            layer.weight.data.copy_(rotated.reshape(original_shape).to(layer.weight.data.dtype))
+            diag = layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+            transformed_weight = transform_flatquant_weight(
+                layer.weight.data, layer.left_trans.data, layer.right_trans.data, diag, left_dim, right_dim
+            )
+            if call is not None:
+                call.capture("weight_transformed", transformed_weight)
+                audit_event(ctx, "weight_transform", backend="modelslim")
+            layer.weight.data.copy_(transformed_weight.to(layer.weight.data.dtype))
             layer._fake_mx_flatquant_weight_transformed = True
+            # Hand off the weight call context to super() so it captures
+            # weight_qdq after the real QDQ in the base class.
+            if call is not None:
+                layer._audit_weight_call = call
         if isinstance(layer, RowParallelLinear):
             left_dim = layer.left_trans.data.shape[0]
             left_block_size = left_dim // layer.tp_size

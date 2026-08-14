@@ -34,7 +34,7 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
-from vllm_ascend.quantization.fake_mx import maybe_fake_mx_quantize_activations
+from vllm_ascend.quantization.boundary import apply_fake_mx_boundary
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -115,8 +115,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Experimental ablation only. AMCT attn-linear leaves this projected
         # GDN input floating point; gdn-core must therefore remain opt-in.
         qkv_projection = self.in_proj_qkv if hasattr(self, "in_proj_qkv") else self.in_proj_qkvz
-        (mixed_qkv,) = maybe_fake_mx_quantize_activations(
-            qkv_projection, mixed_qkv, target="gdn-core"
+        (mixed_qkv,) = apply_fake_mx_boundary(
+            target="gdn-core",
+            owner=qkv_projection,
+            tensors=(mixed_qkv,),
         )
 
         # ============================================================

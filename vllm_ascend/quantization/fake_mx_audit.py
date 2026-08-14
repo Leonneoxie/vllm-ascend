@@ -108,6 +108,8 @@ def _parse_quant_type(quant_type: str) -> tuple[str, str]:
 _audit_config_cache: dict[str, Any] | None | bool = False  # False = not yet loaded
 _intrusive_quant_desc_cache: dict[str, Any] | None = None  # full quant_description for intrusive
 _selected_prefixes: set[str] = set()  # prefixes that emitted node_selected
+_intrusive_model_type: str = ""  # model_type for packed_modules_mapping lookup
+_intrusive_packed_mapping: dict[str, Any] = {}  # cached packed_modules_mapping
 
 
 def _set_audit_config(cfg: dict[str, Any] | None, quant_description: dict[str, Any] | None = None) -> None:
@@ -146,6 +148,43 @@ def _set_audit_config(cfg: dict[str, Any] | None, quant_description: dict[str, A
         _audit_config_cache.get("capture", []),
         _audit_config_cache.get("max_calls", 1),
     )
+
+
+def set_intrusive_model_context(model_type: str, packed_modules_mapping: dict[str, Any]) -> None:
+    """Cache model_type and packed_modules_mapping for intrusive mode.
+
+    Called by :meth:`AscendModelSlimConfig.get_quant_method` after
+    resolving the real ``model_type`` from the vLLM config.  This
+    replaces the previous hardcode of ``"qwen3_5"`` inside
+    :func:`get_intrusive_spec`.
+    """
+    global _intrusive_model_type, _intrusive_packed_mapping
+    _intrusive_model_type = model_type
+    _intrusive_packed_mapping = dict(packed_modules_mapping) if packed_modules_mapping else {}
+
+
+def _get_intrusive_packed_mapping() -> dict[str, Any]:
+    """Return the cached packed_modules_mapping.
+
+    Fails fast if the model context has not been initialized via
+    :func:`set_intrusive_model_context`.
+    """
+    if _intrusive_packed_mapping:
+        return _intrusive_packed_mapping
+    if not _intrusive_model_type:
+        raise RuntimeError(
+            "Intrusive model context has not been initialized. "
+            "set_intrusive_model_context() must be called before "
+            "resolving specs."
+        )
+    try:
+        from vllm_ascend.quantization.modelslim_config import packed_modules_model_mapping
+
+        if _intrusive_model_type not in packed_modules_model_mapping:
+            return {}
+        return packed_modules_model_mapping[_intrusive_model_type]
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(f"Failed to load packed_modules_mapping for intrusive mode: {exc}") from exc
 
 
 def _load_audit_config() -> dict[str, Any] | None:
@@ -464,16 +503,7 @@ def get_intrusive_spec(prefix: str) -> FakeMXSpec | None:
     quant_description = _load_intrusive_quant_description()
     if quant_description is None:
         return None
-    # Resolve packed_modules_mapping from the cached quant_description's
-    # model_type, avoiding get_current_vllm_config() which fails in
-    # profile_run and spawn subprocesses.
-    packed_modules_mapping: dict[str, Any] = {}
-    try:
-        from vllm_ascend.quantization.modelslim_config import packed_modules_model_mapping
-
-        packed_modules_mapping = packed_modules_model_mapping.get("qwen3_5", {})
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(f"Failed to load packed_modules_mapping for intrusive mode: {exc}") from exc
+    packed_modules_mapping = _get_intrusive_packed_mapping()
     spec = resolve_fake_mx_spec(prefix, quant_description, packed_modules_mapping)
     if spec is not None and spec.algorithm not in INTRUSIVE_SUPPORTED_ALGORITHMS:
         raise NotImplementedError(
@@ -534,4 +564,5 @@ __all__ = [
     "get_intrusive_spec",
     "make_context",
     "resolve_fake_mx_spec",
+    "set_intrusive_model_context",
 ]

@@ -273,10 +273,58 @@ def fake_mx_quantize(
 
 
 def fake_mx_target_enabled(projection: torch.nn.Module, target: FakeMXQuantTarget) -> bool:
-    """Return whether an independently configured AMCT quant target is active."""
+    """Return whether an independently configured AMCT quant target is active.
+
+    In intrusive audit mode the policy comes from the audit config rather
+    than from a Fake-MX Scheme attached to the projection.  In BF16 audit
+    mode the function always returns False so that QDQ is skipped.
+    """
+    return _resolve_target_decision(projection, target)[0]
+
+
+def _resolve_target_decision(projection: torch.nn.Module, target: FakeMXQuantTarget) -> tuple[bool, str]:
+    """Return (enabled, reason) for a Fake-MX boundary target.
+
+    reason is one of: applied, bf16_mode, policy_not_matched,
+    scheme_not_fake_mx, target_disabled.
+    """
+    from vllm_ascend.quantization.fake_mx_audit import audit_enabled, get_audit_mode, get_intrusive_spec
+
+    if audit_enabled():
+        mode = get_audit_mode()
+        if mode == "bf16":
+            return False, "bf16_mode"
+        if mode == "intrusive":
+            prefix = getattr(projection, "prefix", "") or ""
+            spec = get_intrusive_spec(prefix)
+            if spec is None:
+                return False, "policy_not_matched"
+            if target in spec.targets:
+                return True, "applied"
+            return False, "target_disabled"
+
     linear_method = getattr(projection, "quant_method", None)
     scheme = getattr(linear_method, "quant_method", None)
-    return bool(getattr(scheme, "is_fake_mx", False) and target in getattr(scheme, "quant_targets", ()))
+    if not getattr(scheme, "is_fake_mx", False):
+        return False, "scheme_not_fake_mx"
+    if target in getattr(scheme, "quant_targets", ()):
+        return True, "applied"
+    return False, "target_disabled"
+
+
+def _resolve_mx_params(projection: torch.nn.Module) -> tuple[FakeMXFormat, int]:
+    """Resolve (mx_format, group_size) from Scheme or intrusive spec."""
+    from vllm_ascend.quantization.fake_mx_audit import audit_enabled, get_audit_mode, get_intrusive_spec
+
+    if audit_enabled() and get_audit_mode() == "intrusive":
+        prefix = getattr(projection, "prefix", "") or ""
+        spec = get_intrusive_spec(prefix)
+        if spec is not None:
+            return spec.mx_format, spec.group_size
+
+    linear_method = getattr(projection, "quant_method", None)
+    scheme = getattr(linear_method, "quant_method", None)
+    return scheme.mx_format, scheme.group_size
 
 
 def maybe_fake_mx_quantize_activations(
@@ -289,17 +337,20 @@ def maybe_fake_mx_quantize_activations(
     ``attn-linear`` itself is selected through ModelSlim module overrides.
     ``attn-cache`` and the experimental ``gdn-core`` boundary are deliberately
     independent because AMCT includes neither in its ``attn-linear`` target.
+
+    In intrusive audit mode the QDQ policy comes from the audit config,
+    providing an independent injection path that does not rely on a
+    Fake-MX Scheme being attached to the projection.
     """
-    linear_method = getattr(projection, "quant_method", None)
-    scheme = getattr(linear_method, "quant_method", None)
     if not fake_mx_target_enabled(projection, target):
         return activations
 
+    fmt, group_size = _resolve_mx_params(projection)
     return tuple(
         fake_mx_quantize(
             tensor,
-            scheme.mx_format,
-            scheme.group_size,
+            fmt,
+            group_size,
         )
         for tensor in activations
     )
