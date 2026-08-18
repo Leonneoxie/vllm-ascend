@@ -603,12 +603,18 @@ class _AscendLACFakeMXLinearMethod(_AscendFakeMXLinearMethod):
     def transform_activation(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         if not getattr(layer, "_lac_has_params", False):
             return x
-        maxval = layer.maxval.data.to(x.device, dtype=torch.float32)
-        minval = layer.minval.data.to(x.device, dtype=torch.float32)
-        if maxval.item() == 0 or minval.item() == 0:
-            return x
         clip_factor_min = layer.clip_factor_min.data.to(x.device, dtype=torch.float32)
         clip_factor_max = layer.clip_factor_max.data.to(x.device, dtype=torch.float32)
+        maxval = layer.maxval.data.to(x.device, dtype=torch.float32)
+        minval = layer.minval.data.to(x.device, dtype=torch.float32)
+        if not getattr(layer, "_lac_range_computed", False):
+            if maxval.item() == 0:
+                maxval = x.to(torch.float32).amax().clamp(min=1e-5)
+                layer.maxval.data.copy_(maxval.to(layer.maxval.dtype))
+            if minval.item() == 0:
+                minval = x.to(torch.float32).amin().clamp(max=-1e-5)
+                layer.minval.data.copy_(minval.to(layer.minval.dtype))
+            layer._lac_range_computed = True
         cur_max = maxval * torch.sigmoid(clip_factor_max)
         cur_min = minval * torch.sigmoid(clip_factor_min)
         return torch.clamp(x.to(torch.float32), min=cur_min, max=cur_max).to(x.dtype)
@@ -622,11 +628,9 @@ class _AscendLACFakeMXLinearMethod(_AscendFakeMXLinearMethod):
             loaded_max = _copy_transform_param(
                 layer.clip_factor_max.data, params, layer, "clip_factor_max", required=False
             )
-            loaded_maxval = _copy_transform_param(layer.maxval.data, params, layer, "maxval", required=False)
-            loaded_minval = _copy_transform_param(layer.minval.data, params, layer, "minval", required=False)
-            layer._lac_has_params = (loaded_min is not None or loaded_max is not None) and (
-                loaded_maxval is not None or loaded_minval is not None
-            )
+            _copy_transform_param(layer.maxval.data, params, layer, "maxval", required=False)
+            _copy_transform_param(layer.minval.data, params, layer, "minval", required=False)
+            layer._lac_has_params = loaded_min is not None or loaded_max is not None
             layer._fake_mx_lac_processed = True
         layer.clip_factor_min = torch.nn.Parameter(layer.clip_factor_min.data.contiguous(), requires_grad=False)
         layer.clip_factor_max = torch.nn.Parameter(layer.clip_factor_max.data.contiguous(), requires_grad=False)
