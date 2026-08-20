@@ -21,8 +21,8 @@ model view, symlinks checkpoint files, and installs the selected config as
   gate/up uses W4A4 and down uses W8A8.
 
 All other modules are explicitly FLOAT. The MLP-only configs set
-`fake_mx_quant_targets` to an empty list, so `attn-cache` and `gdn-core` remain
-off and Attention/GDN projection Linear modules stay FLOAT.
+`fake_mx_quant_targets` to an empty list, so `attn-cache` remains off and
+Attention/GDN projection Linear modules stay FLOAT.
 The two legacy root-level JSON names remain as compatibility aliases for the
 all-W4A4 and all-W8A8 attention configurations.
 

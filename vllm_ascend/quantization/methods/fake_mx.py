@@ -46,7 +46,7 @@ from .registry import get_quant_type_for_scheme, register_scheme
 
 MAX_FLATQUANT_TRANSFORM_DIM = 256
 DEFAULT_TRANSFORM_MATRIX_SIZE = 128
-SUPPORTED_QUANT_TARGETS = frozenset({"attn-linear", "attn-cache", "gdn-core"})
+SUPPORTED_QUANT_TARGETS = frozenset({"attn-linear", "attn-cache"})
 
 
 def _quant_description() -> dict[str, Any]:

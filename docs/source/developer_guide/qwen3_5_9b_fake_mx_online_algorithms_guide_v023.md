@@ -90,18 +90,16 @@ Linear forward
 |---|---|---|
 | `attn-linear` | Attention/GDN projection Linear | 主实验开启 |
 | `attn-cache` | Norm/RoPE 后的 Q/K/V、fused attention/cache 前 | 单独消融 |
-| `gdn-core` | projected `mixed_qkv`、GDN core 前 | 默认关闭 |
 
-Linear 的范围和位宽由 `module_quant_overrides` 决定。`attn-cache` 和
-`gdn-core` 只控制额外的非 Linear 激活边界。
+Linear 的范围和位宽由 `module_quant_overrides` 决定。`attn-cache` 只控制
+额外的标准 Attention Q/K/V 非 Linear 激活边界；GDN core 保持浮点。
 
 `attn-cache` 当前会 QDQ Q/K/V，但 fused Attention 不暴露 softmax 后的 P，
 因此不包含 P/V MatMul 前的 P QDQ。
 
 对应插入代码：
 
-- `vllm_ascend/patch/worker/patch_qwen3_5.py`：Attention Q/K/V；
-- `vllm_ascend/ops/gdn.py`：GDN core 输入。
+- `vllm_ascend/patch/worker/patch_qwen3_5.py`：Attention Q/K/V。
 
 ## 4. 支持的算法
 
@@ -288,7 +286,7 @@ mixed 位宽和相同量化范围的 RTN 基线。
 ## 9. 当前范围
 
 - 当前重点是 Qwen3.5-9B Dense Linear；
-- `attn-cache`、`gdn-core` 作为独立精度消融，默认不启用；
+- `attn-cache` 作为独立精度消融，默认不启用；GDN core 保持浮点；
 - Qwen3.5-35B MoE 的算法参数映射和端到端验证另行实现；
 - 离线预变换/预量化 weight 自动加载不在当前流程；
 - 融合 QDQ kernel 只能替换 `fake_mx_quantize()` 的执行，不改变量化节点。

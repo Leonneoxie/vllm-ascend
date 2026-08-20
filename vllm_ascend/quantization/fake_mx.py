@@ -31,7 +31,7 @@ from vllm.logger import logger
 
 FakeMXBackend = Literal["reference", "kernel", "auto"]
 FakeMXFormat = Literal["mxfp4", "mxfp8"]
-FakeMXQuantTarget = Literal["attn-linear", "attn-cache", "gdn-core"]
+FakeMXQuantTarget = Literal["attn-linear", "attn-cache"]
 FAKE_MX_BACKENDS = frozenset({"reference", "kernel", "auto"})
 
 
@@ -335,8 +335,8 @@ def maybe_fake_mx_quantize_activations(
     """Apply target-gated fake-MX QDQ to non-Linear operator boundaries.
 
     ``attn-linear`` itself is selected through ModelSlim module overrides.
-    ``attn-cache`` and the experimental ``gdn-core`` boundary are deliberately
-    independent because AMCT includes neither in its ``attn-linear`` target.
+    ``attn-cache`` is deliberately independent because AMCT does not include
+    the Q/K/V cache boundary in its ``attn-linear`` target.
 
     In intrusive audit mode the QDQ policy comes from the audit config,
     providing an independent injection path that does not rely on a

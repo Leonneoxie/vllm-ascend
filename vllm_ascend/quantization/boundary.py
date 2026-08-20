@@ -1,9 +1,9 @@
 """Unified Fake-MX boundary QDQ entry point.
 
-Core model code (patch_qwen3_5.py, ops/gdn.py) calls
+Core model code (patch_qwen3_5.py) calls
 ``apply_fake_mx_boundary`` instead of directly importing audit functions.
 This keeps boundary logic in one place and ensures consistent event/tensor
-capture across attn-cache and gdn-core boundaries.
+capture at the attn-cache boundary.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from vllm_ascend.quantization.fake_mx import (
     fake_mx_quantize,
 )
 
-BoundaryTarget = Literal["attn-cache", "gdn-core"]
+BoundaryTarget = Literal["attn-cache"]
 
 _BOUNDARY_CAPTURE_STAGES: dict[str, list[str]] = {
     "attn-cache": [
@@ -29,15 +29,10 @@ _BOUNDARY_CAPTURE_STAGES: dict[str, list[str]] = {
         "attn_v_raw",
         "attn_v_qdq",
     ],
-    "gdn-core": [
-        "gdn_qkv_raw",
-        "gdn_qkv_qdq",
-    ],
 }
 
 _BOUNDARY_SHAPE_KEYS: dict[str, list[str]] = {
     "attn-cache": ["q_shape", "k_shape", "v_shape"],
-    "gdn-core": ["mixed_qkv_shape"],
 }
 
 
@@ -54,10 +49,9 @@ def apply_fake_mx_boundary(
     disabled the original tensors are returned unchanged.
 
     Args:
-        target: Boundary identifier (``"attn-cache"`` or ``"gdn-core"``).
+        target: Boundary identifier (``"attn-cache"``).
         owner: The projection layer that owns the quant config.
-        tensors: Input tensors to quantize (Q, K, V for attn-cache;
-            a single mixed_qkv for gdn-core).
+        tensors: Input Q, K, and V tensors to quantize for attn-cache.
 
     Returns:
         Tensors after boundary QDQ (same count as input).

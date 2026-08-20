@@ -80,10 +80,7 @@ boundaries. It defaults to `["attn-linear"]`:
   before the fused attention/cache boundary. This matches AMCT's Q/K/V operand
   placement, but the fused vLLM attention backend does not expose AMCT's
   post-softmax probability (P) fake-QDQ point.
-- `gdn-core`: experimental ablation that fake-QDQs projected `mixed_qkv`
-  before the recurrent GDN core. It is disabled by default, is not part of
-  AMCT `attn-linear`, and is generally precision-sensitive without an expected
-  quantization benefit.
+
 The MX element/shared-exponent math follows AMCT-Q: 32-element blocks by
 default, shared exponent carry at mantissa `> 1.75`, minimum E8M0 exponent
 `-127`, and half-away-from-zero element rounding. The last tensor dimension
@@ -93,8 +90,7 @@ The Qwen direct-conversion samples use W4A4 MXFP4 for attention/GDN
 projections, Dense MLP, shared experts, and routed experts. Embeddings, the
 visual tower, router gates, and LM head remain floating point. Full-attention
 Q/K/V remain floating point unless `attn-cache` is explicitly enabled. The
-projected GDN `mixed_qkv` also remains floating point unless the experimental
-`gdn-core` target is explicitly enabled.
+projected GDN `mixed_qkv` remains floating point, matching AMCT `attn-linear`.
 
 ## FlatQuant checkpoint contract
 

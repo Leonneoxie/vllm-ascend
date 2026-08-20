@@ -18,7 +18,6 @@ from vllm_ascend.quantization.fake_mx import (
     fake_mx_quantize,
     get_fake_mx_backend,
     learned_hadamard_transform,
-    maybe_fake_mx_quantize_activations,
     maybe_fake_mx_quantize_attention_qkv,
     randomized_hadamard_transform,
 )
@@ -239,32 +238,6 @@ def test_attention_qkv_is_unchanged_when_attn_cache_target_is_disabled():
     actual = maybe_fake_mx_quantize_attention_qkv(projection, *qkv)
 
     assert all(actual_tensor is original_tensor for actual_tensor, original_tensor in zip(actual, qkv))
-
-
-def test_gdn_core_is_independently_opt_in():
-    activation = torch.tensor([[6.0, 5.0, 3.0, 0.25]])
-    projection = type("Projection", (), {})()
-
-    def set_targets(*targets):
-        scheme = type(
-            "FakeMXScheme",
-            (),
-            {
-                "is_fake_mx": True,
-                "mx_format": "mxfp4",
-                "group_size": 4,
-                "quant_targets": frozenset(targets),
-            },
-        )()
-        projection.quant_method = type("LinearMethod", (), {"quant_method": scheme})()
-
-    set_targets("attn-linear")
-    (disabled,) = maybe_fake_mx_quantize_activations(projection, activation, target="gdn-core")
-    set_targets("attn-linear", "gdn-core")
-    (enabled,) = maybe_fake_mx_quantize_activations(projection, activation, target="gdn-core")
-
-    assert disabled is activation
-    torch.testing.assert_close(enabled, fake_mx_quantize(activation, "mxfp4", 4))
 
 
 def test_fake_mxfp4_matches_amct_half_away_from_zero_and_shared_exponent():
