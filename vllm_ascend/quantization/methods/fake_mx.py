@@ -30,6 +30,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.fake_mx import (
     FakeMXFormat,
     fake_mx_quantize,
+    hadamard_transform,
     learned_hadamard_transform,
     randomized_hadamard_transform,
 )
@@ -680,41 +681,32 @@ class AscendW8A8MXFP8LACFakeLinearMethod(_AscendLACFakeMXLinearMethod):
 
 
 class _AscendRHTFakeMXLinearMethod(_AscendFakeMXLinearMethod):
-    """RHT for Linear: accepts original BF16 checkpoint, rotates weight at load time."""
+    """RHT for Linear: accepts original BF16 checkpoint, rotates weight at load time.
+
+    Uses a deterministic normalized Hadamard matrix (no random signs, no seed).
+    The same butterfly structure as ``scipy.linalg.hadamard(n) / sqrt(n)`` is
+    computed in-place via the Fast Walsh-Hadamard Transform (FWHT) without a
+    sign diagonal, matching AMCT-final's ``_HadamardTransform``.
+    """
 
     algorithm = "rht"
 
     def __init__(self):
         super().__init__()
         quant_description = _quant_description()
-        self.rht_group_size = int(quant_description.get("rht_group_size", self.group_size))
-        self.rht_seed = int(quant_description.get("rht_seed", 0))
-
-    @staticmethod
-    def _make_signs(size: int, seed: int, device: torch.device) -> torch.Tensor:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(seed)
-        signs = torch.randint(0, 2, (size,), generator=generator, dtype=torch.int8)
-        return signs.mul_(2).sub_(1).to(device=device)
+        self.rht_matrix_size = int(quant_description.get("rht_matrix_size",
+                                    quant_description.get("rht_group_size", self.group_size)))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        local_input_size = layer.weight.shape[-1]
-        if isinstance(layer, RowParallelLinear):
-            global_input_size = local_input_size * layer.tp_size
-            global_signs = self._make_signs(global_input_size, self.rht_seed, layer.weight.device)
-            start = layer.tp_rank * local_input_size
-            layer.fake_mx_rht_signs = global_signs[start : start + local_input_size]
-        else:
-            layer.fake_mx_rht_signs = self._make_signs(local_input_size, self.rht_seed, layer.weight.device)
         if not getattr(layer, "_fake_mx_rht_weight_rotated", False):
             layer.weight.data.copy_(
-                randomized_hadamard_transform(layer.weight.data, layer.fake_mx_rht_signs, self.rht_group_size)
+                hadamard_transform(layer.weight.data, self.rht_matrix_size)
             )
             layer._fake_mx_rht_weight_rotated = True
         super().process_weights_after_loading(layer)
 
     def transform_activation(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-        return randomized_hadamard_transform(x, layer.fake_mx_rht_signs, self.rht_group_size)
+        return hadamard_transform(x, self.rht_matrix_size)
 
 
 @register_scheme("W4A4_MXFP4_RHT_FAKE", "linear")
@@ -1007,8 +999,10 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
     def __init__(self):
         quant_description = _quant_description()
         self.group_size = int(quant_description.get("group_size", 32))
-        self.rht_group_size = int(quant_description.get("rht_group_size", self.group_size))
-        self.rht_seed = int(quant_description.get("rht_seed", 0))
+        self.rht_matrix_size = int(
+            quant_description.get("rht_matrix_size",
+                                  quant_description.get("rht_group_size", self.group_size))
+        )
         self.hadamard_learning_matrix_size = int(
             quant_description.get("hadamard_learning_matrix_size", DEFAULT_TRANSFORM_MATRIX_SIZE)
         )
@@ -1071,16 +1065,7 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
         if getattr(layer, "_fake_mx_weight_processed", False):
             return
         if self.algorithm == "rht":
-            layer.fake_mx_w13_rht_signs = _AscendRHTFakeMXLinearMethod._make_signs(
-                layer.w13_weight.shape[-1],
-                self.rht_seed,
-                layer.w13_weight.device,
-            )
-            layer.fake_mx_w2_rht_signs = _AscendRHTFakeMXLinearMethod._make_signs(
-                layer.w2_weight.shape[-1],
-                self.rht_seed + 1,
-                layer.w2_weight.device,
-            )
+            pass
         elif self.algorithm == "hadamard_learning":
             matrix_size = self.hadamard_learning_matrix_size
             if layer.w13_weight.shape[-1] % matrix_size or layer.w2_weight.shape[-1] % matrix_size:
@@ -1176,11 +1161,7 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
 
         topk_weights = topk_weights.to(x.dtype)
         if self.algorithm == "rht":
-            x = randomized_hadamard_transform(
-                x,
-                layer.fake_mx_w13_rht_signs,
-                self.rht_group_size,
-            )
+            x = hadamard_transform(x, self.rht_matrix_size)
         # Per-expert learned matrices can only be selected after token
         # dispatch.  Its FC1 transform and QDQ therefore run in moe_mlp.py.
         quantized_x = (
@@ -1213,8 +1194,8 @@ class _AscendFakeMXFusedMoEMethod(AscendMoEScheme):
                 fake_mx_format=self.mx_format,
                 fake_mx_group_size=self.group_size,
                 fake_mx_algorithm=self.algorithm,
-                fake_mx_rht_signs=getattr(layer, "fake_mx_w2_rht_signs", None),
-                fake_mx_rht_group_size=self.rht_group_size,
+                fake_mx_rht_signs=None,
+                fake_mx_rht_group_size=self.rht_matrix_size,
                 fake_mx_w13_transform=getattr(layer, "w13_transform_weight", None),
                 fake_mx_w2_transform=getattr(layer, "w2_transform_weight", None),
                 w1_bias=layer.w13_bias if has_bias else None,

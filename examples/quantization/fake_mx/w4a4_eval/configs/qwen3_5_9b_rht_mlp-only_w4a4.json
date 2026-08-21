@@ -4,8 +4,7 @@
     "attn-linear"
   ],
   "group_size": 32,
-  "rht_group_size": 32,
-  "rht_seed": 2026,
+  "rht_matrix_size": 128,
   "module_quant_overrides": {
     "*embed_tokens*": "FLOAT",
     "*lm_head": "FLOAT",

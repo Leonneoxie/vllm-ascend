@@ -83,6 +83,42 @@ def learned_hadamard_transform(
     return transformed.reshape(original_shape).to(tensor.dtype)
 
 
+def hadamard_transform(
+    tensor: torch.Tensor,
+    matrix_size: int = 128,
+) -> torch.Tensor:
+    """Apply a deterministic normalized Hadamard transform blockwise.
+
+    Uses the same butterfly structure as the Fast Walsh-Hadamard Transform
+    (FWHT) without a random sign diagonal.  The result is identical to
+    multiplying by ``scipy.linalg.hadamard(matrix_size) / sqrt(matrix_size)``
+    but requires no external dependency.  AMCT-final uses the same
+    deterministic Hadamard matrix, so vllm-ascend and AMCT stay in sync.
+    """
+    if not tensor.is_floating_point():
+        raise TypeError(f"RHT requires a floating tensor, got {tensor.dtype}.")
+    if matrix_size <= 0 or matrix_size & (matrix_size - 1):
+        raise ValueError(f"RHT matrix_size must be a positive power of two, got {matrix_size}.")
+    if tensor.shape[-1] % matrix_size:
+        raise ValueError(
+            f"RHT input dimension ({tensor.shape[-1]}) must be divisible by matrix_size ({matrix_size})."
+        )
+
+    original_shape = tensor.shape
+    original_dtype = tensor.dtype
+    blocked = tensor.to(torch.float32).reshape(*original_shape[:-1], -1, matrix_size)
+
+    step = 1
+    while step < matrix_size:
+        butterfly = blocked.reshape(*blocked.shape[:-1], matrix_size // (2 * step), 2, step)
+        left = butterfly[..., 0, :]
+        right = butterfly[..., 1, :]
+        blocked = torch.cat((left + right, left - right), dim=-1).reshape(*blocked.shape)
+        step *= 2
+
+    return (blocked / math.sqrt(matrix_size)).reshape(original_shape).to(original_dtype)
+
+
 def randomized_hadamard_transform(
     tensor: torch.Tensor,
     signs: torch.Tensor,
@@ -374,6 +410,7 @@ __all__ = [
     "fake_mx_quantize",
     "fake_mx_target_enabled",
     "get_fake_mx_backend",
+    "hadamard_transform",
     "learned_hadamard_transform",
     "maybe_fake_mx_quantize_activations",
     "maybe_fake_mx_quantize_attention_qkv",
