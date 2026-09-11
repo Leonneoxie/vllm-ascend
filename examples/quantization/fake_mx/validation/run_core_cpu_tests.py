@@ -51,16 +51,12 @@ def main():
     module("vllm_ascend.ascend_config", get_ascend_config=lambda: None)
     module("vllm_ascend.ascend_forward_context", _EXTRA_CTX=None, MoECommType=types.SimpleNamespace(FUSED_MC2=1))
     module("vllm_ascend.ops.fused_moe.experts_selector", select_experts=None)
-    # Placeholder stand-ins: the real per-expert executors live in moe_mlp.py
-    # (imports torch_npu, unavailable on CPU). The transform factories in
-    # fake_mx_algorithms.moe only close over them; the math itself is covered
-    # by tests/ut/ops/test_moe_mlp.py on a real environment.
-    module(
-        "vllm_ascend.ops.fused_moe.moe_mlp",
-        _apply_expert_flatquant=None,
-        _apply_expert_learned_hadamard=None,
-        _apply_expert_omniquant=None,
-    )
+    # torch_npu and the grouping primitives from moe_mlp are unavailable on
+    # CPU; expert_transforms imports both at module level, so stub them. The
+    # real math is covered by tests/ut/quantization/methods/
+    # test_fake_mx_expert_transforms.py on a torch_npu environment.
+    module("torch_npu", npu_grouped_matmul=None)
+    module("vllm_ascend.ops.fused_moe.moe_mlp", cumsum_group_list=None)
     module("vllm_ascend.ops.fused_moe.moe_runtime_args", build_fused_experts_input=None)
     module("vllm_ascend.utils", maybe_trans_nz=lambda x: x)
     importlib.import_module("vllm_ascend.quantization.methods.fake_mx")

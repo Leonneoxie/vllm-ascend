@@ -891,3 +891,113 @@ def test_fake_mx_moe_apply_passes_generic_transform_slots():
         "fake_mx_format", "fake_mx_group_size", "fake_mx_fc1_transform", "fake_mx_fc2_transform",
     )]
     assert not forbidden, f"algorithm-specific fields leaked into the shared chain: {forbidden}"
+
+
+def _flatquant_linear_layer():
+    layer = torch.nn.Module()
+    layer.prefix = "test"
+    layer.left_trans = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+    layer.right_trans = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+    layer.diag_scale = torch.nn.Parameter(torch.ones(4), requires_grad=False)
+    layer.clip_ratio = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+    layer.weight = torch.nn.Parameter(
+        torch.tensor([[1.0, 2.0, -1.0, 0.5], [0.25, -2.0, 1.0, 3.0]]), requires_grad=False
+    )
+    return layer
+
+
+def test_flatquant_linear_disabled_diag_rejects_non_identity_sidecar_diag():
+    """use_diag=False plus a non-identity sidecar diag must fail (Linear, mirroring MoE)."""
+    config = {
+        "group_size": 4,
+        "flatquant_params_path": "/fake/path.pt",
+        "flatquant_use_diag": False,
+        "flatquant_matrix_size": 2,
+    }
+    sidecar = {
+        "test.left_trans": torch.eye(2),
+        "test.right_trans": torch.eye(2),
+        "test.diag_scale": torch.tensor([2.0, 1.0, 1.0, 1.0]),
+    }
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx_algorithms.linear._quant_description",
+            return_value=config,
+        ),
+        patch.object(flatquant, "_load_transform_params", return_value=sidecar),
+        patch.object(flatquant, "get_tensor_model_parallel_world_size", return_value=1),
+        pytest.raises(ValueError, match="non-identity"),
+    ):
+        method = AscendW4A4MXFP4FakeFlatQuantLinearMethod()
+        layer = _flatquant_linear_layer()
+        method.prepare_weight(layer)
+
+
+def test_flatquant_linear_disabled_diag_skips_diag_on_both_sides():
+    """use_diag=False + no sidecar diag: weight and activation both skip diag
+    while left/right keep the transform paired."""
+    config = {
+        "group_size": 4,
+        "flatquant_params_path": "/fake/path.pt",
+        "flatquant_use_diag": False,
+        "flatquant_matrix_size": 2,
+    }
+    left = torch.tensor([[2.0, 0.5], [0.25, 1.5]])
+    right = torch.tensor([[1.0, 0.2], [0.0, 1.0]])
+    sidecar = {"test.left_trans": left, "test.right_trans": right}
+    layer = _flatquant_linear_layer()
+    original_weight = layer.weight.detach().clone()
+    activation = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx_algorithms.linear._quant_description",
+            return_value=config,
+        ),
+        patch.object(flatquant, "_load_transform_params", return_value=sidecar),
+        patch.object(flatquant, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(flatquant, "fake_mx_quantize", side_effect=lambda weight, _format, _group_size, **_: weight),
+        patch.object(linear, "fake_mx_quantize", side_effect=lambda weight, _format, _group_size, **_: weight),
+    ):
+        method = AscendW4A4MXFP4FakeFlatQuantLinearMethod()
+        layer = _flatquant_linear_layer()
+        method.process_weights_after_loading(layer)
+        layer.aclnn_clip_ratio = 1.0
+        actual = method.apply(layer, activation)
+
+    # The diag placeholder stays untouched (never loaded, never applied) and
+    # the left/right pairing preserves the linear output exactly.
+    torch.testing.assert_close(layer.diag_scale.data, torch.ones(4))
+    torch.testing.assert_close(actual, torch.nn.functional.linear(activation, original_weight), rtol=1e-4, atol=1e-4)
+
+
+def test_flatquant_linear_disabled_diag_accepts_identity_sidecar_diag():
+    """use_diag=False plus an all-ones sidecar diag is a no-op, not a conflict."""
+    config = {
+        "group_size": 4,
+        "flatquant_params_path": "/fake/path.pt",
+        "flatquant_use_diag": False,
+        "flatquant_matrix_size": 2,
+    }
+    sidecar = {
+        "test.left_trans": torch.eye(2),
+        "test.right_trans": torch.eye(2),
+        "test.diag_scale": torch.ones(4),
+    }
+    with (
+        patch(
+            "vllm_ascend.quantization.methods.fake_mx_algorithms.linear._quant_description",
+            return_value=config,
+        ),
+        patch.object(flatquant, "_load_transform_params", return_value=sidecar),
+        patch.object(flatquant, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(flatquant, "fake_mx_quantize", side_effect=lambda weight, _format, _group_size, **_: weight),
+        patch.object(linear, "fake_mx_quantize", side_effect=lambda weight, _format, _group_size, **_: weight),
+    ):
+        method = AscendW4A4MXFP4FakeFlatQuantLinearMethod()
+        layer = _flatquant_linear_layer()
+        method.process_weights_after_loading(layer)
+
+    # All-ones diag never reaches the weight transform; identity left/right
+    # keep the weight unchanged apart from layout.
+    torch.testing.assert_close(layer.weight.data, _flatquant_linear_layer().weight.data)
+    torch.testing.assert_close(layer.diag_scale.data, torch.ones(4))

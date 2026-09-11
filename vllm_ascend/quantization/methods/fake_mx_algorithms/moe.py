@@ -18,11 +18,6 @@ import torch
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-from vllm_ascend.ops.fused_moe.moe_mlp import (
-    _apply_expert_flatquant,
-    _apply_expert_learned_hadamard,
-    _apply_expert_omniquant,
-)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.fake_mx import FakeMXFormat, fake_mx_quantize, randomized_hadamard_transform
 from vllm_ascend.utils import maybe_trans_nz
@@ -38,6 +33,11 @@ from .common import (
     _physical_to_logical_experts,
     _quant_description,
     _validate_weight_state,
+)
+from .expert_transforms import (
+    _apply_expert_flatquant,
+    _apply_expert_learned_hadamard,
+    _apply_expert_omniquant,
 )
 from .flatquant import _get_decompose_dim, transform_flatquant_weight
 from .lht import transform_lht_weight

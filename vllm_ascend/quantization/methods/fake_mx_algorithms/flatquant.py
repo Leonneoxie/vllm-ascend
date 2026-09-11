@@ -34,6 +34,31 @@ MAX_FLATQUANT_TRANSFORM_DIM = 256
 FLATQUANT_TP_BLOCK_DIAGONAL_TOLERANCE = 1e-6
 
 
+def _reject_disabled_diag_conflict(
+    ext_params: dict[str, torch.Tensor],
+    layer: torch.nn.Module,
+) -> None:
+    """Fail fast when diag is disabled but the sidecar carries a real one.
+
+    With ``flatquant_use_diag=False`` the weight inverse transform skips
+    the diag division and the activation transform omits the diag
+    multiplication. A non-identity diag in the sidecar would mean the
+    exported transforms were calibrated with diag enabled, so honouring
+    the switch silently would diverge from the calibrated math.
+    """
+    match = _find_transform_param(ext_params, layer, "diag_scale")
+    if match is None:
+        return
+    value = match[1].to(torch.float32)
+    if not torch.allclose(value, torch.ones_like(value)):
+        raise ValueError(
+            f"flatquant_use_diag is disabled but the sidecar carries a non-identity "
+            f"diag_scale for layer {_layer_prefix(layer)!r}; the weight and activation "
+            "transforms would not match the calibrated math. Enable flatquant_use_diag "
+            "or export the sidecar without diag."
+        )
+
+
 def _is_tp_block_diagonal_transform(transform: torch.Tensor, tp_size: int) -> bool:
     """Return whether a row-parallel transform has no cross-rank terms."""
     if tp_size <= 1:
@@ -197,7 +222,7 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
                 full_input,
                 layer.left_trans,
                 layer.right_trans,
-                layer.diag_scale if hasattr(layer, "diag_scale") else None,
+                layer.diag_scale if self.use_diag_scale and hasattr(layer, "diag_scale") else None,
                 left_dim,
                 right_dim,
             )
@@ -210,7 +235,11 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
                     "FlatQuant transform matrices dimension mismatch: "
                     f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({local_input_size})."
                 )
-            diag = layer.diag_scale if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+            diag = (
+                layer.diag_scale
+                if self.use_diag_scale and hasattr(layer, "diag_scale") and layer.diag_scale is not None
+                else None
+            )
             transformed = transform_flatquant_activation(
                 x, layer.left_trans, layer.right_trans, diag, left_dim, right_dim
             )
@@ -234,7 +263,13 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
         layer_prefix = _layer_prefix(layer)
         left_key = _copy_transform_param(layer.left_trans.data, ext_params, layer, "left_trans")
         _copy_transform_param(layer.right_trans.data, ext_params, layer, "right_trans")
-        _copy_transform_param(layer.diag_scale.data, ext_params, layer, "diag_scale", required=self.use_diag_scale)
+        # The diag switch controls BOTH sides of the transform (mirroring the
+        # MoE contract): disabled means "not loaded, not used anywhere", and a
+        # non-identity sidecar diag under a disabled switch is rejected.
+        if not self.use_diag_scale:
+            _reject_disabled_diag_conflict(ext_params, layer)
+        else:
+            _copy_transform_param(layer.diag_scale.data, ext_params, layer, "diag_scale")
         layer.clip_ratio.data.fill_(1.0)
         logger.debug("FlatQuant: loaded %s for %s", left_key, layer_prefix)
 
@@ -256,7 +291,7 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
                     full_weight,
                     layer.left_trans.data,
                     layer.right_trans.data,
-                    layer.diag_scale.data if hasattr(layer, "diag_scale") else None,
+                    layer.diag_scale.data if self.use_diag_scale else None,
                     left_dim,
                     layer.right_trans.data.shape[0],
                 )
@@ -269,7 +304,7 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
                     layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
                     layer.tp_rank * left_block_size : (layer.tp_rank + 1) * left_block_size,
                 ]
-                if hasattr(layer, "diag_scale") and layer.diag_scale is not None:
+                if self.use_diag_scale and hasattr(layer, "diag_scale") and layer.diag_scale is not None:
                     diag_size = layer.diag_scale.data.shape[0]
                     diag_block_size = diag_size // layer.tp_size
                     layer.diag_scale.data = layer.diag_scale.data[
@@ -278,7 +313,9 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
                 left_dim = layer.left_trans.data.shape[0]
                 right_dim = layer.right_trans.data.shape[0]
                 diag = (
-                    layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+                    layer.diag_scale.data
+                    if self.use_diag_scale and hasattr(layer, "diag_scale") and layer.diag_scale is not None
+                    else None
                 )
                 transformed_weight = transform_flatquant_weight(
                     layer.weight.data, layer.left_trans.data, layer.right_trans.data, diag, left_dim, right_dim
@@ -287,7 +324,11 @@ class FlatQuantLinearMethod(FakeMXLinearMethod):
         else:
             left_dim = layer.left_trans.data.shape[0]
             right_dim = layer.right_trans.data.shape[0]
-            diag = layer.diag_scale.data if hasattr(layer, "diag_scale") and layer.diag_scale is not None else None
+            diag = (
+                layer.diag_scale.data
+                if self.use_diag_scale and hasattr(layer, "diag_scale") and layer.diag_scale is not None
+                else None
+            )
             transformed_weight = transform_flatquant_weight(
                 layer.weight.data, layer.left_trans.data, layer.right_trans.data, diag, left_dim, right_dim
             )
