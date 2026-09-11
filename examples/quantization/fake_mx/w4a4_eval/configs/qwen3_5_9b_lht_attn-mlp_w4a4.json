@@ -1,6 +1,6 @@
 {
   "default_quant_type": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
-  "lht_params_path": "../Qwen3.5-9B-lht-attn-mlp-params/lht_params.safetensors",
+  "lht_params_path": "lht_params.safetensors",
   "group_size": 32,
   "hadamard_learning_matrix_size": 128,
   "module_quant_overrides": {

@@ -25,7 +25,7 @@ Copy one of the sample files to the model directory as
 vllm serve /path/to/qwen3.5-model --quantization ascend
 ```
 
-Supported scheme names:
+Supported scheme names (five validated algorithms, Linear):
 
 - `W4A4_MXFP4_FAKE`: fake MXFP4 weights and activations.
 - `W8A8_MXFP8_FAKE`: fake MXFP8 weights and activations.
@@ -36,79 +36,44 @@ Supported scheme names:
 - `W4A4_MXFP4_HADAMARD_LEARNING_FAKE` /
   `W8A8_MXFP8_HADAMARD_LEARNING_FAKE`: AMCT-Q learnable block transform
   followed by fake MX QDQ.
-- `W4A4_MXFP4_AUTOROUND_FAKE` / `W8A8_MXFP8_AUTOROUND_FAKE`.
+
+MoE (routed experts) additionally supports `W4A4_MXFP4_FAKE` /
+`W8A8_MXFP8_FAKE` and `W4A4_MXFP4_HADAMARD_LEARNING_FAKE` /
+`W8A8_MXFP8_HADAMARD_LEARNING_FAKE` only. See
+[CORE-REFACTOR.md](CORE-REFACTOR.md) for the module layout.
 
 `default_quant_type` applies to modules without an explicit `*.weight` entry.
 `module_quant_overrides` is evaluated in JSON insertion order; the first glob
 matching the vLLM module prefix wins. An explicit per-weight entry has the
 highest priority and can use `FLOAT` to skip a module.
 
-### QDQ execution backend
-
-`fake_mx_backend` controls how every enabled Fake MX node computes the same
-quantize-dequantize contract. It is independent of `fake_mx_quant_targets` and
-module precision overrides:
-
-- `reference` (default): use the AMCT-compatible PyTorch golden implementation.
-- `kernel`: require the optional fused QDQ kernel and fail immediately if it
-  cannot execute the request.
-- `auto`: use the fused kernel when supported, otherwise log once and fall back
-  to `reference`.
-
-```json
-{
-  "fake_mx_backend": "reference",
-  "fake_mx_quant_targets": []
-}
-```
-
-The optional operator adapter is
-`vllm_ascend/quantization/kernels/fake_mx.py`. When the external kernel is
-delivered, update only `_load_external_fake_mx_kernel()` to import its actual
-single-input/single-output QDQ entry point and add finalized capability checks
-to `fake_mx_kernel_support_reason()`. Existing Linear, Attention, GDN, and MoE
-insertion points continue to call the stable `fake_mx_quantize()` wrapper.
-
-### AMCT-compatible attention targets
-
-`fake_mx_quant_targets` independently controls Qwen3.5 non-Linear attention
-injection boundaries. It defaults to `[]` and currently accepts only
-`"attn-cache"`:
-
-- `attn-cache`: additionally fake-QDQ normalized/RoPE-applied Q/K/V immediately
-  before the fused attention/cache boundary. This matches AMCT's Q/K/V operand
-  placement, but the fused vLLM attention backend does not expose AMCT's
-  post-softmax probability (P) fake-QDQ point.
-
-Attention/GDN/MLP/MoE Linear operands and weights are selected exclusively by
-`module_quant_overrides`; they do not require a target entry.
-
 The MX element/shared-exponent math follows AMCT-Q: 32-element blocks by
 default, shared exponent carry at mantissa `> 1.75`, minimum E8M0 exponent
 `-127`, and half-away-from-zero element rounding. The last tensor dimension
 must be divisible by `group_size`, as required by AMCT's `unflatten` contract.
-
-The Qwen direct-conversion samples use W4A4 MXFP4 for attention/GDN
-projections, Dense MLP, shared experts, and routed experts. Embeddings, the
-visual tower, router gates, and LM head remain floating point. Full-attention
-Q/K/V remain floating point unless `attn-cache` is explicitly enabled. The
-projected GDN `mixed_qkv` remains floating point, matching AMCT `attn-linear`.
+The reference implementation in `vllm_ascend/quantization/fake_mx.py` is the
+only QDQ path; the optional fused-kernel adapter seam has been removed.
 
 ## FlatQuant checkpoint contract
 
-Fake FlatQuant is a linear-only validation path. Each enabled linear layer must
-provide floating-point, FlatQuant-transformed `weight` plus `left_trans`,
-`right_trans`, and `clip_ratio` tensors from calibration. The runtime applies:
+Fake FlatQuant is a linear-only validation path. The checkpoint always supplies
+the **original** BF16/FP16 `weight`; the calibration artifact
+(`flatquant_params_path`, safetensors) provides `left_trans` [L, L],
+`right_trans` [R, R] and optional `diag_scale` [L*R] per enabled layer
+(`L * R == in_features`). At load time the runtime applies the inverse weight
+transform `W' = inv(left) @ (W / diag) @ inv(right).T`, and on every forward
+the activation transform `x' = left.T @ (reshape(x) * diag) @ right` followed
+by block clipping and fake MX QDQ:
 
 ```text
-x -> left_trans @ reshape(x) @ right_trans
+x -> left_trans.T @ reshape(x) @ right_trans
   -> block clipping
   -> fake MX QDQ
-  -> floating-point GEMM with the fake-MX-QDQ transformed weight
+  -> floating-point GEMM with the inverse-transformed weight
 ```
 
 Do not select a FlatQuant fake scheme for a plain pretrained checkpoint that
-does not contain these transform parameters. Routed MoE FlatQuant is not
+does not have the transform artifact. Routed MoE FlatQuant is not
 implemented because the current Ascend FlatQuant contract is linear-only.
 
 ## Algorithm checkpoint contracts
@@ -117,18 +82,24 @@ The algorithm examples are not drop-in configs for an untouched pretrained
 checkpoint. Each algorithm expects specific calibration artifacts:
 
 - **FlatQuant**: `flatquant_params_path` must point to a safetensors file
-  containing `left_trans`, `right_trans`, `clip_ratio`, and optional
-  `diag_scale` per enabled layer. The runtime loads these, applies the inverse
-  transform to the weight, and applies the forward transform to activations.
-- **RHT**: No external params needed. The runtime generates random signs from
-  `rht_seed` and rotates both weight and activations at load/forward time.
+  containing `left_trans`, `right_trans`, and optional `diag_scale` per
+  enabled layer. The runtime applies the inverse transform to the weight and
+  the forward transform to activations.
+- **RHT**: No external params needed. The runtime deterministically generates
+  Rademacher signs with `rht_seed` (default 0, matching AMCT's
+  `_HadamardTransform`) and applies the same normalized FWHT
+  (`randomized_hadamard_transform`) to both weight (at load time) and
+  activations (every forward). `rht_matrix_size` defaults to 128.
 - **Hadamard Learning (LHT)**: `lht_params_path` must point to a safetensors
   file containing `transform_weight` (K×K matrix) per enabled layer. The
-  runtime loads the matrix, applies `inv(T).T` to the weight, and applies
-  `x @ T` to activations.
-- **OmniQuant / AutoRound**: `fake_mx_weight_state: "prequantized_qdq"` marks
-  a checkpoint that already contains the final MX QDQ error. The runtime
-  deliberately skips a second weight QDQ.
+  runtime loads the matrix, applies the paired `W @ Q` block transform to the
+  weight, and applies `x @ Q` to activations. MoE LHT requires
+  `fake_mx_weight_state: "hadamard_learning_transformed_fp"` plus per-expert
+  `w13/w2_transform_weight`.
+- **OmniQuant**: `omniquant_params_path` must point to a safetensors file
+  containing per-dimension `log_scale`. The runtime scales the weight up by
+  `exp(log_scale)` (clamped to [1e-4, 1e4]) and the activation down, pairing
+  with MX QDQ.
 
 See
 `docs/source/developer_guide/fake_mx_algorithm_adaptation_v023.md` for the
@@ -148,7 +119,8 @@ offline/runtime boundary and exact insertion points.
 - `group_size` defaults to 32, matching OCP MX formats.
 
 See
-`docs/source/developer_guide/qwen3_5_a4w4_mxfp_hadamard_flatquant_validation_v023.md`
-for Qwen3.5 attention, prefill/decode, Hadamard, FlatQuant, and MoE details.
-Hadamard Learning 的训练语义、导出映射和逐 expert 插入点见
-`docs/source/developer_guide/qwen3_5_hadamard_learning_fake_mx_v023.md`。
+`docs/source/developer_guide/qwen3_5_9b_fake_mx_online_algorithms_guide_v023.md`
+and
+`docs/source/developer_guide/fake_mx_kernel_and_algorithm_extension_guide_v023.md`
+for Qwen3.5 algorithm details, the kernel extension contract, and per-expert
+insertion points.

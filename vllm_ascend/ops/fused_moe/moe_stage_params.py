@@ -16,6 +16,7 @@
 #
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -65,21 +66,13 @@ class MoEQuantParams:
     is_per_channel_weight: bool = False
     fake_mx_format: str | None = None
     fake_mx_group_size: int = 32
-    fake_mx_algorithm: str = "rtn"
-    fake_mx_rht_signs: torch.Tensor | None = None
-    fake_mx_rht_group_size: int = 32
-    fake_mx_w13_transform: torch.Tensor | None = None
-    fake_mx_w2_transform: torch.Tensor | None = None
-    # FlatQuant per-expert state for MoE FlatQuant fake scheme.
-    # Each dict maps component names ("left_trans", "right_trans", "diag_scale")
-    # to per-expert tensors shaped [num_local_experts, ...].
-    fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None
-    fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None
-    # OmniQuant per-expert activation scale for MoE OmniQuant fake scheme.
-    # Shaped [num_local_experts, input_dim]; activation is divided by the
-    # matching expert scale before QDQ (weight was pre-scaled at load time).
-    fake_mx_omniquant_fc1_scale: torch.Tensor | None = None
-    fake_mx_omniquant_fc2_scale: torch.Tensor | None = None
+    # Post-dispatch activation transforms for the fake-MX MoE path. Each
+    # callable takes (hidden_states, group_list, group_list_type) and returns
+    # the transformed tensor; None means "no transform at this position".
+    # Algorithm-specific state is closed over by the callable, so the shared
+    # execution path never branches on the algorithm name.
+    fake_mx_fc1_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None
+    fake_mx_fc2_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None
 
     @property
     def is_quant(self) -> bool:

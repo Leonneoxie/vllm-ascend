@@ -1,5 +1,6 @@
 {
   "default_quant_type": "W4A4_MXFP4_OMNIQUANT_FAKE",
+  "omniquant_params_path": "omniquant_params.safetensors",
   "group_size": 32,
   "module_quant_overrides": {
     "*embed_tokens*": "FLOAT",
@@ -8,6 +9,6 @@
     "*self_attn*": "W4A4_MXFP4_OMNIQUANT_FAKE",
     "*linear_attn*": "W4A4_MXFP4_OMNIQUANT_FAKE",
     "*shared_expert*": "W4A4_MXFP4_OMNIQUANT_FAKE",
-    "*experts*": "W4A4_MXFP4_OMNIQUANT_FAKE"
+    "*experts*": "W4A4_MXFP4_FAKE"
   }
 }

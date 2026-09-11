@@ -1,5 +1,7 @@
 # Qwen3.5-9B W4A4 伪量化评测指南
 
+当前重构分支仅保留 RTN、FlatQuant、OmniQuant、LHT、RHT。实现结构、接入步骤和支持限制见 [五算法重构说明](../CORE-REFACTOR.md)。历史扩展文档中的 AutoRound/LWC/LAC 不再适用于此分支。
+
 本文档说明如何使用 vllm-ascend 的 fake_mx 伪量化方案对 Qwen3.5-9B 进行 W4A4 量化评测。
 所有配置文件、脚本和转换工具均在本目录中，与 `vllm_ascend/quantization/methods/fake_mx.py` 代码保持一致。
 
@@ -147,7 +149,7 @@ model.language_memory.layers.{N}.mlp.down_proj.weight           # MLP down
 cp configs/qwen3_5_9b_rtn_attn-only_w4a4.json /path/to/model/quant_model_description.json
 
 # 启动 vllm serve
-# RTN 不需要 --enforce-eager；RHT/FlatQuant/LHT 建议加 --enforce-eager
+# 第五参数 eager（默认）用于对照；decode_graph 用于逐算法验证图模式性能
 ./scripts/serve/vllm_serve.sh /path/to/model 0 8001 configs/qwen3_5_9b_rtn_attn-only_w4a4.json
 
 # 运行评测
@@ -230,7 +232,7 @@ python scripts/convert/convert_ptq_to_vllm.py \
 # 将参数文件放到模型目录（或配置中指定的路径）
 cp /data/flatquant_attn_params.safetensors /path/to/model/flatquant_params.safetensors
 
-# 启动 vllm serve（FlatQuant/LHT 必须加 --enforce-eager）
+# 启动 eager 对照；FlatQuant/LHT 的 decode_graph 需先通过一致性验证
 ./scripts/serve/vllm_serve.sh /path/to/model 0 8001 \
   configs/qwen3_5_9b_flatquant_attn-only_w4a4.json --enforce-eager
 

@@ -3,7 +3,7 @@
 import argparse
 import importlib
 import json
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 

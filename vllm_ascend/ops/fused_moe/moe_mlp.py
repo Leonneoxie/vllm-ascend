@@ -34,7 +34,6 @@ from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAn
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.fake_mx import (
     fake_mx_quantize,
-    hadamard_transform,
 )
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -709,63 +708,19 @@ def unquant_apply_mlp(
     topk_ids: torch.Tensor | None = None,
     fake_mx_format: str | None = None,
     fake_mx_group_size: int = 32,
-    fake_mx_algorithm: str = "rtn",
-    fake_mx_rht_signs: torch.Tensor | None = None,
-    fake_mx_rht_group_size: int = 32,
-    fake_mx_w13_transform: torch.Tensor | None = None,
-    fake_mx_w2_transform: torch.Tensor | None = None,
-    fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None,
-    fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None,
-    fake_mx_omniquant_fc1_scale: torch.Tensor | None = None,
-    fake_mx_omniquant_fc2_scale: torch.Tensor | None = None,
+    fake_mx_fc1_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None,
+    fake_mx_fc2_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
 
-    if fake_mx_algorithm == "hadamard_learning":
-        if fake_mx_w13_transform is None:
-            raise ValueError("fake-MX Hadamard Learning requires per-expert FC1 transforms.")
-        hidden_states = _apply_expert_learned_hadamard(
-            hidden_states,
-            fake_mx_w13_transform,
-            group_list,
-            group_list_type,
-        )
+    # Post-dispatch FC1 activation transform: the algorithm closes over its
+    # own state; the shared path only sees "transform present or not".
+    if fake_mx_fc1_transform is not None:
         if fake_mx_format is None:
-            raise ValueError("fake-MX Hadamard Learning requires a fake MX format.")
-        hidden_states = fake_mx_quantize(
-            hidden_states,
-            fake_mx_format,
-            fake_mx_group_size,
-        )
-    elif fake_mx_algorithm == "flatquant":
-        if fake_mx_flatquant_fc1_state is None:
-            raise ValueError("fake-MX FlatQuant requires per-expert FC1 state.")
-        if fake_mx_format is None:
-            raise ValueError("fake-MX FlatQuant requires a fake MX format.")
-        hidden_states = _apply_expert_flatquant(
-            hidden_states,
-            fake_mx_flatquant_fc1_state,
-            group_list,
-            group_list_type,
-        )
-        hidden_states = fake_mx_quantize(
-            hidden_states,
-            fake_mx_format,
-            fake_mx_group_size,
-        )
-    elif fake_mx_algorithm == "omniquant":
-        if fake_mx_omniquant_fc1_scale is None:
-            raise ValueError("fake-MX OmniQuant requires per-expert FC1 scale.")
-        if fake_mx_format is None:
-            raise ValueError("fake-MX OmniQuant requires a fake MX format.")
-        hidden_states = _apply_expert_omniquant(
-            hidden_states,
-            fake_mx_omniquant_fc1_scale,
-            group_list,
-            group_list_type,
-        )
+            raise ValueError("fake-MX per-expert FC1 transform requires a fake MX format.")
+        hidden_states = fake_mx_fc1_transform(hidden_states, group_list, group_list_type)
         hidden_states = fake_mx_quantize(
             hidden_states,
             fake_mx_format,
@@ -824,35 +779,10 @@ def unquant_apply_mlp(
             up.clamp_(min=-swiglu_limit, max=swiglu_limit)
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
-    if fake_mx_algorithm == "rht":
-        gate_up_out = hadamard_transform(gate_up_out, fake_mx_rht_group_size)
-    elif fake_mx_algorithm == "hadamard_learning":
-        if fake_mx_w2_transform is None:
-            raise ValueError("fake-MX Hadamard Learning requires per-expert FC2 transforms.")
-        gate_up_out = _apply_expert_learned_hadamard(
-            gate_up_out,
-            fake_mx_w2_transform,
-            group_list,
-            group_list_type,
-        )
-    elif fake_mx_algorithm == "flatquant":
-        if fake_mx_flatquant_fc2_state is None:
-            raise ValueError("fake-MX FlatQuant requires per-expert FC2 state.")
-        gate_up_out = _apply_expert_flatquant(
-            gate_up_out,
-            fake_mx_flatquant_fc2_state,
-            group_list,
-            group_list_type,
-        )
-    elif fake_mx_algorithm == "omniquant":
-        if fake_mx_omniquant_fc2_scale is None:
-            raise ValueError("fake-MX OmniQuant requires per-expert FC2 scale.")
-        gate_up_out = _apply_expert_omniquant(
-            gate_up_out,
-            fake_mx_omniquant_fc2_scale,
-            group_list,
-            group_list_type,
-        )
+    # Post-activation FC2 transform: same contract as FC1 (the RHT variant
+    # ignores the group arguments because its transform is expert-independent).
+    if fake_mx_fc2_transform is not None:
+        gate_up_out = fake_mx_fc2_transform(gate_up_out, group_list, group_list_type)
 
     if fake_mx_format is not None:
         gate_up_out = fake_mx_quantize(
@@ -930,15 +860,8 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             topk_ids=mlp_compute_input.topk_ids,
             fake_mx_format=mlp_compute_input.quant.fake_mx_format,
             fake_mx_group_size=mlp_compute_input.quant.fake_mx_group_size,
-            fake_mx_algorithm=mlp_compute_input.quant.fake_mx_algorithm,
-            fake_mx_rht_signs=mlp_compute_input.quant.fake_mx_rht_signs,
-            fake_mx_rht_group_size=mlp_compute_input.quant.fake_mx_rht_group_size,
-            fake_mx_w13_transform=mlp_compute_input.quant.fake_mx_w13_transform,
-            fake_mx_w2_transform=mlp_compute_input.quant.fake_mx_w2_transform,
-            fake_mx_flatquant_fc1_state=mlp_compute_input.quant.fake_mx_flatquant_fc1_state,
-            fake_mx_flatquant_fc2_state=mlp_compute_input.quant.fake_mx_flatquant_fc2_state,
-            fake_mx_omniquant_fc1_scale=mlp_compute_input.quant.fake_mx_omniquant_fc1_scale,
-            fake_mx_omniquant_fc2_scale=mlp_compute_input.quant.fake_mx_omniquant_fc2_scale,
+            fake_mx_fc1_transform=mlp_compute_input.quant.fake_mx_fc1_transform,
+            fake_mx_fc2_transform=mlp_compute_input.quant.fake_mx_fc2_transform,
         )
 
     assert w1_scale is not None and w2_scale is not None

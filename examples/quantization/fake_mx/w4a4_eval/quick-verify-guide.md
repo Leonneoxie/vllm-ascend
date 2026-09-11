@@ -65,7 +65,7 @@ run_task(task)
 2. **不需要在 model name 里加 port**——统一用 `--served-model-name qwen3.5`
 3. **vllm 加载完配置后不再读文件**——可以安全替换配置文件
 4. **时序错开是必须的**：必须等前一个 vllm 完全加载完配置（日志出现 "Loaded N fake-MX transform params"）后，才能替换配置文件启动下一个
-5. **FlatQuant/LHT 必须 `--enforce-eager`**
+5. **先以 eager 建立对照，再逐算法验证 decode_graph**：FlatQuant/LHT 图模式兼容性尚需实测；启动脚本第五参数可传 `decode_graph`。不能同时传 `--enforce-eager` 和图配置。通过输出一致性和性能验证后，再在完整测评使用图模式。
 6. **不要用 heredoc 创建 JSON 配置**——shell 会吃掉引号。用 python json.dump 或 scp 传输
 
 ### 步骤

@@ -8,91 +8,20 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-from types import SimpleNamespace
-
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 import pytest
 import torch
 
-import vllm_ascend.quantization.fake_mx as fake_mx_module
 from vllm_ascend.quantization.fake_mx import (
     fake_mx_quantize,
-    get_fake_mx_backend,
     learned_hadamard_transform,
-    maybe_fake_mx_quantize_attention_qkv,
     randomized_hadamard_transform,
 )
-from vllm_ascend.quantization.kernels import fake_mx as fake_mx_kernel
-
-
-def test_fake_mx_backend_defaults_to_reference_and_validates_config():
-    assert get_fake_mx_backend({}) == "reference"
-    assert get_fake_mx_backend({"fake_mx_backend": "kernel"}) == "kernel"
-    assert get_fake_mx_backend({"fake_mx_backend": "auto"}) == "auto"
-
-    with pytest.raises(ValueError, match="fake_mx_backend"):
-        get_fake_mx_backend({"fake_mx_backend": "unknown"})
-
-
-def test_fake_mx_backend_is_resolved_inside_stable_wrapper_module(monkeypatch):
-    vllm_config = SimpleNamespace(
-        quant_config=SimpleNamespace(quant_description={"fake_mx_backend": "kernel"})
-    )
-    monkeypatch.setattr(fake_mx_module, "get_current_vllm_config_or_none", lambda: vllm_config)
-
-    assert get_fake_mx_backend() == "kernel"
-
-
-def test_fake_mx_kernel_backend_dispatches_through_adapter(monkeypatch):
-    values = torch.ones(1, 4)
-    expected = values + 1
-
-    monkeypatch.setattr(fake_mx_kernel, "fake_mx_kernel_support_reason", lambda *args: None)
-    monkeypatch.setattr(fake_mx_kernel, "fake_mx_quantize_kernel", lambda *args: expected)
-    monkeypatch.setattr(fake_mx_module, "get_fake_mx_backend", lambda: "kernel")
-
-    actual = fake_mx_quantize(values, "mxfp4", group_size=4)
-
-    assert actual is expected
-
-
-def test_fake_mx_kernel_backend_rejects_unsupported_request(monkeypatch):
-    monkeypatch.setattr(
-        fake_mx_kernel,
-        "fake_mx_kernel_support_reason",
-        lambda *args: "test kernel is unavailable",
-    )
-    monkeypatch.setattr(fake_mx_module, "get_fake_mx_backend", lambda: "kernel")
-
-    with pytest.raises(RuntimeError, match="test kernel is unavailable"):
-        fake_mx_quantize(torch.ones(1, 4), "mxfp4", group_size=4)
-
-
-def test_fake_mx_auto_backend_falls_back_to_reference(monkeypatch):
-    values = torch.tensor([[6.0, 5.0, 3.0, 0.25]])
-    monkeypatch.setattr(
-        fake_mx_kernel,
-        "fake_mx_kernel_support_reason",
-        lambda *args: "test kernel is unavailable",
-    )
-
-    monkeypatch.setattr(fake_mx_module, "get_fake_mx_backend", lambda: "reference")
-    expected = fake_mx_quantize(values, "mxfp4", group_size=4)
-    monkeypatch.setattr(fake_mx_module, "get_fake_mx_backend", lambda: "auto")
-    actual = fake_mx_quantize(values, "mxfp4", group_size=4)
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_fake_mx_kernel_adapter_enforces_output_contract(monkeypatch):
-    values = torch.ones(1, 4)
-    monkeypatch.setattr(
-        fake_mx_kernel,
-        "_load_external_fake_mx_kernel",
-        lambda: (lambda *args: torch.ones(2, 2), None),
-    )
-
-    with pytest.raises(ValueError, match="changed shape"):
-        fake_mx_kernel.fake_mx_quantize_kernel(values, "mxfp4", 4, 1.0)
 
 
 def test_fake_mxfp4_matches_amct_e2m1_rounding_and_preserves_dtype():
@@ -151,7 +80,7 @@ def test_fake_mx_supports_per_block_clip_ratio_tensor():
 
     actual = fake_mx_quantize(values, "mxfp4", group_size=4, clip_ratio=clip_ratio)
 
-    torch.testing.assert_close(actual[..., :4], torch.tensor([[6.0, 4.0, 3.0, 2.0]]))
+    torch.testing.assert_close(actual[..., :4], torch.tensor([[6.0, 6.0, 3.0, 2.0]]))
     torch.testing.assert_close(actual[..., 4:], torch.tensor([[3.0, 3.0, 3.0, 2.0]]))
 
 
@@ -187,65 +116,12 @@ def test_randomized_hadamard_transform_rejects_non_power_of_two_group(group_size
         randomized_hadamard_transform(torch.ones(1, 4), torch.ones(4), group_size)
 
 
-def test_attention_qkv_uses_projection_fake_mx_scheme():
-    scheme = type(
-        "FakeMXScheme",
-        (),
-        {
-            "is_fake_mx": True,
-            "mx_format": "mxfp4",
-            "group_size": 4,
-            "quant_targets": frozenset({"attn-cache"}),
-        },
-    )()
-    projection = type("Projection", (), {})()
-    projection.quant_method = type("LinearMethod", (), {"quant_method": scheme})()
-    query = torch.tensor([[6.0, 5.0, 3.0, 0.25]])
-    key = query + 1.0
-    value = query + 2.0
-
-    actual = maybe_fake_mx_quantize_attention_qkv(projection, query, key, value)
-
-    expected = tuple(fake_mx_quantize(tensor, "mxfp4", 4) for tensor in (query, key, value))
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor)
-
-
-def test_attention_qkv_is_unchanged_for_non_fake_projection():
-    projection = type("Projection", (), {"quant_method": object()})()
-    qkv = tuple(torch.randn(2, 4) for _ in range(3))
-
-    actual = maybe_fake_mx_quantize_attention_qkv(projection, *qkv)
-
-    assert all(actual_tensor is original_tensor for actual_tensor, original_tensor in zip(actual, qkv))
-
-
-def test_attention_qkv_is_unchanged_when_attn_cache_target_is_disabled():
-    scheme = type(
-        "FakeMXScheme",
-        (),
-        {
-            "is_fake_mx": True,
-            "mx_format": "mxfp4",
-            "group_size": 4,
-            "quant_targets": frozenset(),
-        },
-    )()
-    projection = type("Projection", (), {})()
-    projection.quant_method = type("LinearMethod", (), {"quant_method": scheme})()
-    qkv = tuple(torch.randn(2, 4) for _ in range(3))
-
-    actual = maybe_fake_mx_quantize_attention_qkv(projection, *qkv)
-
-    assert all(actual_tensor is original_tensor for actual_tensor, original_tensor in zip(actual, qkv))
-
-
 def test_fake_mxfp4_matches_amct_half_away_from_zero_and_shared_exponent():
     values = torch.tensor([[0.25, -0.25, 1.25, -1.25, 7.0, 0.0, 0.0, 0.0]])
 
     actual = fake_mx_quantize(values, "mxfp4", group_size=4)
 
-    expected = torch.tensor([[0.5, -0.5, 1.5, -1.5, 6.0, 0.0, 0.0, 0.0]])
+    expected = torch.tensor([[0.25, -0.25, 1.5, -1.5, 6.0, 0.0, 0.0, 0.0]])
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

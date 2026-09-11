@@ -2,6 +2,7 @@
   "default_quant_type": "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
   "group_size": 32,
   "hadamard_learning_matrix_size": 128,
+  "fake_mx_weight_state": "hadamard_learning_transformed_fp",
   "module_quant_overrides": {
     "*embed_tokens*": "FLOAT",
     "*lm_head": "FLOAT",

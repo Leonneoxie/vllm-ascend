@@ -57,6 +57,8 @@ dataclass directly.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
@@ -142,15 +144,8 @@ def build_fused_experts_input(
     is_per_channel_weight: bool = False,
     fake_mx_format: str | None = None,
     fake_mx_group_size: int = 32,
-    fake_mx_algorithm: str = "rtn",
-    fake_mx_rht_signs: torch.Tensor | None = None,
-    fake_mx_rht_group_size: int = 32,
-    fake_mx_w13_transform: torch.Tensor | None = None,
-    fake_mx_w2_transform: torch.Tensor | None = None,
-    fake_mx_flatquant_fc1_state: dict[str, torch.Tensor] | None = None,
-    fake_mx_flatquant_fc2_state: dict[str, torch.Tensor] | None = None,
-    fake_mx_omniquant_fc1_scale: torch.Tensor | None = None,
-    fake_mx_omniquant_fc2_scale: torch.Tensor | None = None,
+    fake_mx_fc1_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None,
+    fake_mx_fc2_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None,
     w1_scale: list[torch.Tensor] | torch.Tensor | None = None,
     w2_scale: list[torch.Tensor] | torch.Tensor | None = None,
     w1_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
@@ -205,15 +200,8 @@ def build_fused_experts_input(
             is_per_channel_weight=is_per_channel_weight,
             fake_mx_format=fake_mx_format,
             fake_mx_group_size=fake_mx_group_size,
-            fake_mx_algorithm=fake_mx_algorithm,
-            fake_mx_rht_signs=fake_mx_rht_signs,
-            fake_mx_rht_group_size=fake_mx_rht_group_size,
-            fake_mx_w13_transform=fake_mx_w13_transform,
-            fake_mx_w2_transform=fake_mx_w2_transform,
-            fake_mx_flatquant_fc1_state=fake_mx_flatquant_fc1_state,
-            fake_mx_flatquant_fc2_state=fake_mx_flatquant_fc2_state,
-            fake_mx_omniquant_fc1_scale=fake_mx_omniquant_fc1_scale,
-            fake_mx_omniquant_fc2_scale=fake_mx_omniquant_fc2_scale,
+            fake_mx_fc1_transform=fake_mx_fc1_transform,
+            fake_mx_fc2_transform=fake_mx_fc2_transform,
         ),
         swiglu_limit=swiglu_limit,
         lora_context=lora_context,
