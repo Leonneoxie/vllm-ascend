@@ -229,7 +229,9 @@ class TestPerExpertActivationTransforms(unittest.TestCase):
 
     def test_per_expert_transform_rejects_type_2_group_list(self):
         with (
-            patch("vllm_ascend.ops.fused_moe.moe_mlp.logger.error") as mock_log_error,
+            patch(
+                "vllm_ascend.quantization.methods.fake_mx_algorithms.expert_transforms.logger.error"
+            ) as mock_log_error,
             self.assertRaisesRegex(
                 NotImplementedError,
                 "do not support group_list_type=2",
@@ -374,7 +376,9 @@ class TestVectorizedPerExpertTransforms(unittest.TestCase):
     def test_learned_hadamard_rejects_type_2_group_list(self):
         hidden_states, transform_weight = self._make_lht_case(3)
         with (
-            patch("vllm_ascend.ops.fused_moe.moe_mlp.logger.error") as mock_log_error,
+            patch(
+                "vllm_ascend.quantization.methods.fake_mx_algorithms.expert_transforms.logger.error"
+            ) as mock_log_error,
             self.assertRaisesRegex(
                 NotImplementedError,
                 "do not support group_list_type=2",
@@ -408,7 +412,10 @@ class TestVectorizedPerExpertTransforms(unittest.TestCase):
         hidden_states, fc_state = self._make_flatquant_case(7)
         group_list = torch.tensor([3, 1, 2, 1])
         expected = _apply_expert_flatquant(hidden_states, fc_state, group_list, 1)
-        with patch("vllm_ascend.ops.fused_moe.moe_mlp._FLATQUANT_MAX_ROWS_PER_CHUNK", 2):
+        with patch(
+            "vllm_ascend.quantization.methods.fake_mx_algorithms.expert_transforms._FLATQUANT_MAX_ROWS_PER_CHUNK",
+            2,
+        ):
             actual = _apply_expert_flatquant(hidden_states, fc_state, group_list, 1)
         torch.testing.assert_close(actual, expected)
 
@@ -449,7 +456,9 @@ class TestVectorizedPerExpertTransforms(unittest.TestCase):
     def test_flatquant_rejects_type_2_group_list(self):
         hidden_states, fc_state = self._make_flatquant_case(3)
         with (
-            patch("vllm_ascend.ops.fused_moe.moe_mlp.logger.error") as mock_log_error,
+            patch(
+                "vllm_ascend.quantization.methods.fake_mx_algorithms.expert_transforms.logger.error"
+            ) as mock_log_error,
             self.assertRaisesRegex(
                 NotImplementedError,
                 "do not support group_list_type=2",

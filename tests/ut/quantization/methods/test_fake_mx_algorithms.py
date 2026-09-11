@@ -61,6 +61,7 @@ def test_core_weight_and_activation_contract(name, cls, dtype):
         patch.object(common, "_load_safetensors", return_value=params),
         patch.object(common, "_resolve_model_artifact", side_effect=lambda p: p),
         patch.object(flatquant, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(omniquant, "get_tensor_model_parallel_world_size", return_value=1),
     ):
         method = cls()
         layer = torch.nn.Module()
