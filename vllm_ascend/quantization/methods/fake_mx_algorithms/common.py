@@ -92,11 +92,36 @@ def _find_transform_param(
     layer: torch.nn.Module,
     suffix: str,
 ) -> tuple[str, torch.Tensor] | None:
-    for prefix in _layer_prefix_candidates(layer):
-        key = f"{prefix}.{suffix}"
-        if key in params:
-            return key, params[key]
-    return None
+    """Find the sidecar parameter for a layer, validating fused projections.
+
+    For a fused ``gate_up_proj`` the AMCT export may carry the same
+    transform under the physical name and/or both logical names. All
+    present candidates must agree bit-for-bit: vLLM applies ONE transform
+    to the shared activation, so diverging per-projection transforms
+    cannot be honoured and must fail loudly instead of silently picking
+    the first match.
+    """
+    matches = [
+        (key, params[key])
+        for key in (f"{prefix}.{suffix}" for prefix in _layer_prefix_candidates(layer))
+        if key in params
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        first_key, first_value = matches[0]
+        first_fp32 = first_value.to(torch.float32)
+        for key, value in matches[1:]:
+            if value.shape != first_value.shape or not torch.allclose(value.to(torch.float32), first_fp32):
+                raise ValueError(
+                    f"Fused projection transform mismatch for {suffix!r}: {first_key!r} and {key!r} "
+                    "carry different values. vLLM fuses gate/up into a single gate_up_proj with one "
+                    "shared input transform, so diverging per-projection transforms cannot be "
+                    "honoured. Re-export the sidecar with one shared transform (or align the "
+                    "calibration) and retry."
+                )
+        logger.debug("Fused projection transform %r: %d matching keys, all identical", suffix, len(matches))
+    return matches[0]
 
 
 def _copy_transform_param(

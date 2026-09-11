@@ -15,7 +15,7 @@ from vllm_ascend.quantization.methods.fake_mx import (
     AscendW4A4MXFP4OmniQuantFakeLinearMethod,
     AscendW4A4MXFP4RHTFakeLinearMethod,
 )
-from vllm_ascend.quantization.methods.fake_mx_algorithms import common, flatquant, linear, moe, omniquant
+from vllm_ascend.quantization.methods.fake_mx_algorithms import common, flatquant, linear, moe, omniquant, rht
 
 CASES = (
     ("rtn", AscendW4A4MXFP4FakeLinearMethod),
@@ -1001,3 +1001,81 @@ def test_flatquant_linear_disabled_diag_accepts_identity_sidecar_diag():
     # keep the weight unchanged apart from layout.
     torch.testing.assert_close(layer.weight.data, _flatquant_linear_layer().weight.data)
     torch.testing.assert_close(layer.diag_scale.data, torch.ones(4))
+
+
+def test_fused_projection_transform_mismatch_fails():
+    """Diverging gate/up sidecar transforms must fail, not silently pick one."""
+    layer = torch.nn.Module()
+    layer.prefix = "layers.0.mlp.gate_up_proj"
+    params = {
+        "layers.0.mlp.gate_proj.transform_weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        "layers.0.mlp.up_proj.transform_weight": torch.tensor([[4.0, 3.0], [2.0, 1.0]]),
+    }
+    with pytest.raises(ValueError, match="Fused projection transform mismatch"):
+        common._find_transform_param(params, layer, "transform_weight")
+
+
+def test_fused_projection_transform_identical_candidates_accepted():
+    """Identical gate/up exports (the normal AMCT case) resolve to one match."""
+    layer = torch.nn.Module()
+    layer.prefix = "layers.0.mlp.gate_up_proj"
+    shared = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    params = {
+        "layers.0.mlp.gate_proj.transform_weight": shared.clone(),
+        "layers.0.mlp.up_proj.transform_weight": shared.clone(),
+    }
+    key, value = common._find_transform_param(params, layer, "transform_weight")
+    assert key == "layers.0.mlp.gate_proj.transform_weight"
+    torch.testing.assert_close(value, shared)
+
+
+def test_fake_mx_moe_rejects_apply_router_weight_on_input():
+    """The router-weight-on-input combination is banned: QDQ is nonlinear, so
+    pre- vs post-dispatch algorithms would apply it on opposite sides."""
+    config = {"group_size": 4}
+    with (
+        patch.object(moe, "_quant_description", return_value=config),
+        patch.object(moe, "get_ascend_config", return_value=Mock(eplb_config=Mock(dynamic_eplb=False))),
+    ):
+        method = moe.FakeMXMoEMethod()
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(torch.ones(2, 8, 4), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+    with pytest.raises(NotImplementedError, match="apply_router_weight_on_input"):
+        method.apply(
+            layer,
+            torch.ones(1, 4),
+            torch.ones(1, 2),
+            top_k=2,
+            renormalize=True,
+            apply_router_weight_on_input=True,
+        )
+
+
+def test_rht_signs_sidecar_validation():
+    """Runtime-generated RHT signs are validated bit-for-bit against an
+    optional AMCT sidecar; mismatch and missing keys fail loudly."""
+    signs = common._make_rademacher_signs(4, 0)
+    layer = torch.nn.Module()
+    layer.prefix = "test"
+
+    # No sidecar: summary log path, signs returned unchanged.
+    torch.testing.assert_close(rht._validated_rht_signs(signs, 0, 4, None, layer), signs)
+
+    # Matching sidecar: accepted.
+    with patch.object(rht, "_load_transform_params", return_value={"test.rht_signs": signs.clone()}):
+        rht._validated_rht_signs(signs, 0, 4, "sidecar.safetensors", layer)
+
+    # Mismatching sidecar: rejected.
+    with (
+        patch.object(rht, "_load_transform_params", return_value={"test.rht_signs": -signs}),
+        pytest.raises(ValueError, match="RHT signs mismatch"),
+    ):
+        rht._validated_rht_signs(signs, 0, 4, "sidecar.safetensors", layer)
+
+    # Sidecar without the signs key: rejected.
+    with (
+        patch.object(rht, "_load_transform_params", return_value={}),
+        pytest.raises(KeyError, match="rht_signs"),
+    ):
+        rht._validated_rht_signs(signs, 0, 4, "sidecar.safetensors", layer)

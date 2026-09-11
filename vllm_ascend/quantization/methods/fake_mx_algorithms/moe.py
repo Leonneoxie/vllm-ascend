@@ -41,6 +41,7 @@ from .expert_transforms import (
 )
 from .flatquant import _get_decompose_dim, transform_flatquant_weight
 from .lht import transform_lht_weight
+from .rht import _validated_rht_signs
 
 # ---- Post-dispatch transform factories ----
 # Each factory binds the algorithm state into a callable with the shared
@@ -183,6 +184,15 @@ class FakeMXMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
     ) -> torch.Tensor:
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "apply_router_weight_on_input is not supported by fake-MX MoE: the router "
+                "weight would be applied on opposite sides of the activation QDQ depending "
+                "on the algorithm (pre-dispatch QDQ for RTN/RHT vs post-dispatch transform+QDQ "
+                "for LHT/OmniQuant/FlatQuant), and QDQ is nonlinear, so the results would "
+                "differ across algorithms and from AMCT. Disable the combination for "
+                "validation."
+            )
         self._validate_execution_path()
         num_shared_experts = getattr(layer, "n_shared_experts", 0) or 0
         num_logical_experts = get_moe_num_logical_experts(
@@ -367,6 +377,7 @@ class RHTMoEMethod(FakeMXMoEMethod):
             self.config.get("rht_matrix_size", self.config.get("rht_group_size", self.group_size))
         )
         self.rht_seed = int(self.config.get("rht_seed", 0))
+        self.params_path = self.config.get("rht_params_path")
         self._rht_signs: torch.Tensor | None = None
 
     def _get_signs(self) -> torch.Tensor:
@@ -375,7 +386,13 @@ class RHTMoEMethod(FakeMXMoEMethod):
         return self._rht_signs
 
     def prepare_weight(self, layer: torch.nn.Module) -> None:
-        signs = self._get_signs()
+        signs = _validated_rht_signs(
+            self._get_signs(),
+            self.rht_seed,
+            self.rht_matrix_size,
+            self.params_path,
+            layer,
+        )
         # FC1 runs pre-dispatch in quantize_input; only FC2 needs a
         # post-activation transform slot.
         layer._fake_mx_fc2_transform = _rht_fc2_transform(signs, self.rht_matrix_size)
