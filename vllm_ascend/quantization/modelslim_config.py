@@ -25,6 +25,7 @@ import glob
 import json
 import os
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import Any, Optional
 
@@ -53,6 +54,7 @@ if vllm_version_is("0.23.0"):
 else:
     from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
 
+from .fake_mx_audit import audit_enabled, audit_event, get_audit_mode, make_context, set_intrusive_model_context
 from .methods import get_scheme_class
 
 
@@ -65,6 +67,60 @@ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 
 # The config filename that ModelSlim generates after quantizing a model.
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
+FAKE_MX_QUANT_TYPES = frozenset(
+    {
+        "W4A4_MXFP4_FAKE",
+        "W8A8_MXFP8_FAKE",
+        "W4A4_MXFP4_FLATQUANT_FAKE",
+        "W8A8_MXFP8_FLATQUANT_FAKE",
+        "W4A4_MXFP4_OMNIQUANT_FAKE",
+        "W8A8_MXFP8_OMNIQUANT_FAKE",
+        "W4A4_MXFP4_RHT_FAKE",
+        "W8A8_MXFP8_RHT_FAKE",
+        "W4A4_MXFP4_HADAMARD_LEARNING_FAKE",
+        "W8A8_MXFP8_HADAMARD_LEARNING_FAKE",
+        "W4A4_MXFP4_AUTOROUND_FAKE",
+        "W8A8_MXFP8_AUTOROUND_FAKE",
+        "W4A4_MXFP4_LWC_FAKE",
+        "W8A8_MXFP8_LWC_FAKE",
+        "W4A4_MXFP4_LAC_FAKE",
+        "W8A8_MXFP8_LAC_FAKE",
+    }
+)
+
+
+def _get_fake_mx_quant_type(quant_description: Mapping[str, Any], prefix: str) -> str | None:
+    """Resolve an optional fake-MX default or glob override for a module."""
+    overrides = quant_description.get("module_quant_overrides", {})
+    if overrides:
+        if not isinstance(overrides, Mapping):
+            raise TypeError("module_quant_overrides must be a mapping of glob pattern to quant type.")
+        for pattern, quant_type in overrides.items():
+            if fnmatchcase(prefix, pattern) or fnmatchcase(f"{prefix}.weight", pattern):
+                if quant_type not in FAKE_MX_QUANT_TYPES and quant_type != "FLOAT":
+                    raise ValueError(
+                        f"Unsupported fake-MX override {quant_type!r} for pattern {pattern!r}. "
+                        f"Expected one of {sorted(FAKE_MX_QUANT_TYPES)} or 'FLOAT'."
+                    )
+                if audit_enabled():
+                    ctx = make_context(prefix, algorithm="config")
+                    audit_event(
+                        ctx, "fake_mx_quant_type_resolved", source="override", pattern=pattern, quant_type=quant_type
+                    )
+                return quant_type
+
+    default_quant_type = quant_description.get("default_quant_type")
+    if default_quant_type is None:
+        return None
+    if default_quant_type not in FAKE_MX_QUANT_TYPES:
+        raise ValueError(
+            f"default_quant_type only supports fake-MX types {sorted(FAKE_MX_QUANT_TYPES)}, got {default_quant_type!r}."
+        )
+    if audit_enabled():
+        ctx = make_context(prefix, algorithm="config")
+        audit_event(ctx, "fake_mx_quant_type_resolved", source="default", quant_type=default_quant_type)
+    return default_quant_type
+
 
 # key: model_type
 # value: dict of fused module name -> list of original module names
@@ -360,10 +416,16 @@ def get_linear_quant_type(
     """
     proj_name = prefix.split(".")[-1]
     if proj_name in packed_modules_mapping:
-        quant_type = None
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name) for shard_proj_name in packed_modules_mapping[proj_name]
         ]
+        shard_keys = [shard_prefix + ".weight" for shard_prefix in shard_prefixes]
+        if not any(shard_key in quant_description for shard_key in shard_keys):
+            fake_quant_type = _get_fake_mx_quant_type(quant_description, prefix)
+            if fake_quant_type is not None:
+                return fake_quant_type
+
+        quant_type = None
         for shard_prefix in shard_prefixes:
             shard_quant_type = quant_description[shard_prefix + ".weight"]
 
@@ -378,7 +440,14 @@ def get_linear_quant_type(
                 logger.error(err_msg)
                 raise ValueError(err_msg)
     else:
-        quant_type = quant_description[prefix + ".weight"]
+        weight_key = prefix + ".weight"
+        if weight_key in quant_description:
+            quant_type = quant_description[weight_key]
+        else:
+            quant_type = _get_fake_mx_quant_type(quant_description, prefix)
+            if quant_type is None:
+                # Preserve the existing error for malformed ModelSlim configs.
+                quant_type = quant_description[weight_key]
     return quant_type
 
 
@@ -442,6 +511,11 @@ def create_scheme_for_layer(
     # Use registry to get scheme class
     scheme_cls = get_scheme_class(quant_type, layer_type)
     if scheme_cls is not None:
+        if audit_enabled():
+            ctx = make_context(prefix, algorithm="config")
+            audit_event(
+                ctx, "scheme_created", layer_type=layer_type, quant_type=quant_type, scheme_cls=scheme_cls.__name__
+            )
         return scheme_cls()
 
     err_msg = (
@@ -469,6 +543,23 @@ class AscendModelSlimConfig(QuantizationConfig):
         self.model_type: str | None = None
         self.hf_to_vllm_mapper: WeightsMapper | None = None
         self._mapper_applied = False
+        self._add_kvcache_quant_metadata()
+        self._inject_audit_config()
+
+    def _inject_audit_config(self) -> None:
+        """Inject audit config from quant_description into the global cache."""
+        from .fake_mx_audit import _set_audit_config
+
+        _set_audit_config(self.quant_description.get("fake_mx_audit"), self.quant_description)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        # Re-inject audit config when unpickled in EngineCore subprocess.
+        self._inject_audit_config()
         self._add_kvcache_quant_metadata()
 
     def __repr__(self) -> str:
@@ -631,15 +722,107 @@ class AscendModelSlimConfig(QuantizationConfig):
             self.packed_modules_mapping = packed_modules_model_mapping.get(model_type, {})
         prefix = self.quant_prefix_mapper(model_type, prefix)
 
+        if audit_enabled():
+            set_intrusive_model_context(model_type, self.packed_modules_mapping)
+
+        from vllm_ascend.quantization.router import resolve_quant_route
+
+        if isinstance(layer, LinearBase):
+            domain = "linear"
+            selected = not self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping)
+        elif isinstance(layer, AttentionLayerBase) and self.is_c8_quant_layer(prefix):
+            domain = "kv_cache"
+            selected = True
+        elif isinstance(layer, AttentionLayerBase) and (
+            self.is_fa_quant_layer(prefix) or self.is_indexer_quant_layer(prefix)
+        ):
+            domain = "attention"
+            selected = True
+        elif _is_fused_moe_layer(layer):
+            domain = "moe"
+            selected = not self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping)
+        elif isinstance(layer, VocabParallelEmbedding):
+            domain = "embedding"
+            selected = self._has_quant_weight(prefix, self.packed_modules_mapping) and not self.is_layer_skipped_ascend(
+                prefix, self.packed_modules_mapping
+            )
+        else:
+            logger.debug("No quant method matched for %s, falling back to base", prefix)
+            return None
+
+        route = resolve_quant_route(domain=domain, prefix=prefix, selected=selected)
+
+        if route == "unsupported":
+            raise ValueError(
+                f"Intrusive mode does not support domain {domain!r} "
+                f"for prefix {prefix!r} (model_type={model_type!r}). "
+                f"Only 'linear' domain is supported in intrusive mode."
+            )
+
+        if route == "unquantized":
+            if audit_enabled():
+                ctx = make_context(prefix, algorithm="config")
+                audit_event(
+                    ctx,
+                    "quant_method_selected",
+                    layer_type=type(layer).__name__,
+                    method="Unquantized",
+                    audit_mode=get_audit_mode(),
+                    route=route,
+                )
+            if isinstance(layer, LinearBase):
+                from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
+                return AscendUnquantizedLinearMethod()
+            if _is_fused_moe_layer(layer):
+                from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+                return AscendUnquantizedFusedMoEMethod(layer.moe_config)
+            if isinstance(layer, VocabParallelEmbedding):
+                return UnquantizedEmbeddingMethod()
+            return None
+
+        if route == "intrusive":
+            from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
+            if audit_enabled():
+                ctx = make_context(prefix, algorithm="config")
+                audit_event(
+                    ctx,
+                    "quant_method_selected",
+                    layer_type="LinearBase",
+                    method="AscendUnquantizedLinearMethod",
+                    audit_mode=get_audit_mode(),
+                    route=route,
+                )
+            return AscendUnquantizedLinearMethod()
+
         if isinstance(layer, LinearBase):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
-                # Delayed import to avoid circular import
                 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
+                if audit_enabled():
+                    ctx = make_context(prefix, algorithm="config")
+                    audit_event(
+                        ctx,
+                        "quant_method_selected",
+                        layer_type="LinearBase",
+                        method="AscendUnquantizedLinearMethod",
+                        skipped=True,
+                    )
                 return AscendUnquantizedLinearMethod()
             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
+            if audit_enabled():
+                ctx = make_context(prefix, algorithm="config")
+                audit_event(
+                    ctx,
+                    "quant_method_selected",
+                    layer_type="LinearBase",
+                    method="AscendLinearMethod",
+                    scheme=scheme.__class__.__name__,
+                )
             return AscendLinearMethod(scheme)
         elif isinstance(layer, AttentionLayerBase) and (
             self.is_fa_quant_layer(prefix) or self.is_indexer_quant_layer(prefix)
@@ -654,7 +837,6 @@ class AscendModelSlimConfig(QuantizationConfig):
             return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
         elif _is_fused_moe_layer(layer):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
-                # Delayed import to avoid circular import
                 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
                 logger.debug("Select AscendUnquantizedFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
@@ -681,6 +863,20 @@ class AscendModelSlimConfig(QuantizationConfig):
     def is_layer_skipped_ascend(self, prefix: str, fused_mapping: Mapping[str, list[str]] = MappingProxyType({})):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        fake_quant_type = _get_fake_mx_quant_type(self.quant_description, prefix)
+        if fake_quant_type is not None:
+            if proj_name not in fused_mapping and f"{prefix}.weight" in self.quant_description:
+                return self.quant_description[f"{prefix}.weight"] == "FLOAT"
+            if proj_name in fused_mapping:
+                shard_keys = [
+                    f"{prefix.replace(proj_name, shard_proj_name)}.weight"
+                    for shard_proj_name in fused_mapping[proj_name]
+                ]
+                if not any(shard_key in self.quant_description for shard_key in shard_keys):
+                    return fake_quant_type == "FLOAT"
+            else:
+                return fake_quant_type == "FLOAT"
+
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name) for shard_proj_name in fused_mapping[proj_name]
@@ -797,6 +993,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                 self.quant_description = json.load(f)
             self._apply_extra_quant_adaptations()
             self._add_kvcache_quant_metadata()
+            self._inject_audit_config()
             return
 
         # Collect diagnostic info for the error message
