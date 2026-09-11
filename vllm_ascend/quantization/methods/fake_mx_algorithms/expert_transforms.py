@@ -208,8 +208,7 @@ def _apply_expert_learned_hadamard(
     whole transform is a single ``npu_grouped_matmul`` whose group_list is
     the token group_list scaled by the block count. Rows beyond the
     dispatched tokens are zero-filled by the op and restored from the input
-    afterwards. fp32 operands keep the result identical to the previous
-    per-expert loop implementation.
+    afterwards. Operands use the input dtype, matching AMCT and Linear LHT.
     """
     if transform_weight.ndim != 3:
         raise ValueError(
@@ -240,10 +239,10 @@ def _apply_expert_learned_hadamard(
     blocks = input_dim // matrix_size
     if group_list.dtype != torch.int64:
         group_list = group_list.to(torch.int64)
-    x_sub = hidden_states.reshape(-1, matrix_size).to(torch.float32)
+    x_sub = hidden_states.reshape(-1, matrix_size)
     out_sub = torch_npu.npu_grouped_matmul(
         x=[x_sub],
-        weight=[transform_weight.to(torch.float32).contiguous()],
+        weight=[transform_weight.to(device=hidden_states.device, dtype=hidden_states.dtype).contiguous()],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,
@@ -358,5 +357,4 @@ def _apply_expert_omniquant(
         "MoE OmniQuant",
         transform_expert,
     )
-
 

@@ -168,8 +168,11 @@ def test_lht_moe_parameters_and_deferred_activation_qdq():
     layer = torch.nn.Module()
     weights = method.get_weight(2, 4, 8, torch.float32)
     assert weights["w13_transform_weight"].shape == weights["w2_transform_weight"].shape == (2, 4, 4)
-    # Identity initialization: experts missing from the sidecar fall back to
-    # a mathematically paired no-op transform.
+    # Placeholders only; missing sidecar entries fail during preparation.
+    bf16_weights = method.get_weight(2, 4, 8, torch.bfloat16)
+    assert bf16_weights["w13_weight"].dtype == torch.bfloat16
+    assert bf16_weights["w13_transform_weight"].dtype == torch.float32
+    assert bf16_weights["w2_transform_weight"].dtype == torch.float32
     torch.testing.assert_close(weights["w13_transform_weight"], torch.eye(4).repeat(2, 1, 1))
     for key, value in weights.items():
         init = value if "transform_weight" in key else torch.ones_like(value)
@@ -197,22 +200,23 @@ def test_lht_moe_parameters_and_deferred_activation_qdq():
     assert layer.w2_weight.shape == (2, 4, 8)
 
 
-def test_lht_weight_formula_uses_inv_t_transpose():
-    """transform_lht_weight must compute W @ inv(T).T, not W @ T."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_lht_weight_formula_matches_amct(dtype):
+    """Even rounded matrices must follow AMCT's direct multiplication."""
     weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     transform = torch.tensor([[2.0, 0.5], [0.25, 1.5]])  # non-orthogonal
 
+    weight = weight.to(dtype)
     result = moe.transform_lht_weight(weight, transform, 2)
 
-    inv_t_t = common._inverse_fp32(transform, transpose=True)
-    expected = weight.to(torch.float32).reshape(-1, 2) @ inv_t_t
+    expected = weight.reshape(-1, 2) @ transform.to(dtype)
     expected = expected.reshape(weight.shape)
     torch.testing.assert_close(result, expected)
 
-    # Verify it differs from the old orthogonal-assumption formula W @ T.
-    old = weight.to(torch.float32).reshape(-1, 2) @ transform.to(torch.float32)
-    old = old.reshape(weight.shape)
-    assert not torch.allclose(result, old), "Formula should differ from W@T for non-orthogonal T"
+    assert result.dtype == dtype
+    from vllm_ascend.quantization.fake_mx import learned_hadamard_transform
+
+    torch.testing.assert_close(learned_hadamard_transform(weight, transform), expected)
 
 
 def test_lht_moe_transforms_weights_per_expert_at_load_time():

@@ -61,7 +61,7 @@ def _fake_grouped_matmul(**kwargs):
 
 
 def _lht_loop_reference(hidden_states, transform_weight, group_list, group_list_type):
-    """Pre-vectorization per-expert loop math (fp32 round-trip per segment)."""
+    """AMCT per-expert reference: matrix cast to the operand dtype."""
     num_experts = transform_weight.shape[0]
     matrix_size = transform_weight.shape[-1]
     boundaries = cumsum_group_list(group_list, group_list_type, 0, expert_num=num_experts)
@@ -72,9 +72,9 @@ def _lht_loop_reference(hidden_states, transform_weight, group_list, group_list_
         if end > start:
             segment = hidden_states[start:end]
             outputs.append(
-                segment.to(torch.float32)
+                segment
                 .reshape(-1, matrix_size)
-                .matmul(transform_weight[expert_idx].to(torch.float32))
+                .matmul(transform_weight[expert_idx].to(device=segment.device, dtype=segment.dtype))
                 .reshape(segment.shape)
                 .to(hidden_states.dtype)
             )

@@ -269,7 +269,7 @@ class FakeMXMoEMethod(AscendMoEScheme):
 
 class LHTMoEMethod(FakeMXMoEMethod):
     """Per-expert LHT: loads transform matrices from sidecar and applies
-    ``W @ inv(T).T`` to each expert's weight at load time (no pre-transformed
+    ``W @ Q`` to each expert's weight, matching AMCT (no pre-transformed
     checkpoint required)."""
 
     algorithm = "hadamard_learning"
@@ -294,7 +294,7 @@ class LHTMoEMethod(FakeMXMoEMethod):
     ) -> dict[str, Any]:
         weights = super().get_weight(num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype)
         matrix_size = self.hadamard_learning_matrix_size
-        eye = torch.eye(matrix_size, dtype=params_dtype)
+        eye = torch.eye(matrix_size, dtype=torch.float32)
         weights.update(
             {
                 # Identity placeholders: prepare_weight overwrites every slot

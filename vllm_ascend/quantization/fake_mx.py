@@ -35,9 +35,9 @@ def learned_hadamard_transform(
 ) -> torch.Tensor:
     """Apply AMCT-Q's learned blockwise Hadamard-like transform.
 
-    AMCT-Q learns one invertible ``K x K`` matrix ``T`` and evaluates an
-    activation as ``reshape(x, -1, K) @ T``.  The offline converter must pair
-    this with ``reshape(weight, -1, K) @ inv(T).T`` before weight fake-QDQ.
+    AMCT learns an orthogonal ``K x K`` matrix ``Q`` and evaluates both
+    activation and weight as ``reshape(value, -1, K) @ Q`` before QDQ.
+    Match AMCT's operand dtype, including rounding the exported matrix.
     ``transform_weight`` remains floating point; this helper only simulates
     the transform and does not require a native Hadamard/MX operator.
     """
@@ -58,9 +58,9 @@ def learned_hadamard_transform(
 
     original_shape = tensor.shape
     transformed = (
-        tensor.to(torch.float32)
+        tensor
         .reshape(-1, matrix_size)
-        .matmul(transform_weight.to(device=tensor.device, dtype=torch.float32))
+        .matmul(transform_weight.to(device=tensor.device, dtype=tensor.dtype))
     )
     return transformed.reshape(original_shape).to(tensor.dtype)
 

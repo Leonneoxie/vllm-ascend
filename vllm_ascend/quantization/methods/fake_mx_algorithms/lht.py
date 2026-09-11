@@ -17,7 +17,7 @@ from vllm.logger import logger
 
 from vllm_ascend.quantization.fake_mx import learned_hadamard_transform
 
-from .common import DEFAULT_TRANSFORM_MATRIX_SIZE, _copy_transform_param, _inverse_fp32, _load_transform_params
+from .common import DEFAULT_TRANSFORM_MATRIX_SIZE, _copy_transform_param, _load_transform_params
 from .linear import FakeMXLinearMethod
 
 
@@ -26,23 +26,19 @@ def transform_lht_weight(
     transform_weight: torch.Tensor,
     matrix_size: int,
 ) -> torch.Tensor:
-    """LHT weight inverse transform: W' = W @ inv(T).T (block-wise).
+    """Match AMCT's Cayley LHT: both weights and activations multiply Q.
 
-    The learned transform matrix T is invertible but not necessarily
-    orthogonal, so inv(T).T != T in general.  The activation forward
-    transform is x' = x @ T; the paired weight transform must be
-    W' = W @ inv(T).T so that x' @ W'.T == x @ W.T.
+    Do not invert the exported (possibly rounded) Q: AMCT also uses Q
+    directly for inv_t=True, with the matrix cast to the operand dtype.
     """
-    original_shape = weight.shape
-    weight_blocked = weight.to(torch.float32).reshape(-1, matrix_size)
-    inv_t_t = _inverse_fp32(transform_weight, transpose=True)
-    rotated = weight_blocked @ inv_t_t
-    return rotated.reshape(original_shape)
+    if transform_weight.shape != (matrix_size, matrix_size):
+        raise ValueError("LHT transform shape must match matrix_size.")
+    return learned_hadamard_transform(weight, transform_weight)
 
 
 class LHTLinearMethod(FakeMXLinearMethod):
     """LHT for Linear: accepts original BF16 checkpoint, loads external transform
-    matrix and applies inverse transform to weight at load time."""
+    matrix and applies the AMCT orthogonal transform at load time."""
 
     algorithm = "hadamard_learning"
     supports_pertensor_layer_type = True
