@@ -1,7 +1,9 @@
 # Qwen3.5-9B W4A4 伪量化评测指南
 
+当前分支仅保留 RTN、FlatQuant、OmniQuant、LHT、RHT（Linear 与 MoE 均支持）。实现结构与接入步骤见 [fake_mx README](../README.md)。历史扩展文档中的 AutoRound/LWC/LAC 不再适用于此分支。
+
 本文档说明如何使用 vllm-ascend 的 fake_mx 伪量化方案对 Qwen3.5-9B 进行 W4A4 量化评测。
-所有配置文件、脚本和转换工具均在本目录中，与 `vllm_ascend/quantization/methods/fake_mx.py` 代码保持一致。
+所有配置文件、脚本和转换工具均在本目录中，与 `vllm_ascend/quantization/methods/fake_mx_algorithms/` 算法包（`methods/fake_mx.py` 为 scheme 注册 shim）保持一致。
 
 ## 目录结构
 
@@ -9,7 +11,7 @@
 w4a4_eval/
 ├── README.md                          # 本文档
 ├── quick-verify-guide.md              # 快速验证方案（Level 子集）
-├── configs/                           # 16 个量化配置文件
+├── configs/                           # 19 个量化配置文件
 │   ├── qwen3_5_9b_rtn_attn-only_w4a4.json
 │   ├── qwen3_5_9b_rtn_mlp-only_w4a4.json
 │   ├── qwen3_5_9b_rtn_attn-mlp_w4a4.json
@@ -22,6 +24,9 @@ w4a4_eval/
 │   ├── qwen3_5_9b_flatquant_mlp-only_w4a4.json
 │   ├── qwen3_5_9b_flatquant_attn-mlp_w4a4.json
 │   ├── qwen3_5_9b_flatquant_attn-only_w4a4-w8a8-mixed.json
+│   ├── qwen3_5_9b_omniquant_attn-only_w4a4.json
+│   ├── qwen3_5_9b_omniquant_mlp-only_w4a4.json
+│   ├── qwen3_5_9b_omniquant_attn-mlp_w4a4.json
 │   ├── qwen3_5_9b_lht_attn-only_w4a4.json
 │   ├── qwen3_5_9b_lht_mlp-only_w4a4.json
 │   ├── qwen3_5_9b_lht_attn-mlp_w4a4.json
@@ -29,6 +34,7 @@ w4a4_eval/
 ├── scripts/
 │   ├── serve/vllm_serve.sh            # vllm serve 启动脚本
 │   ├── eval/run_math500.py            # MATH-500 评测脚本
+│   ├── eval/run_limited_eval.py       # 小样本快速验证（limit per-subset）
 │   ├── ptq/
 │   │   ├── extract_ptq_data.sh        # 校准数据提取
 │   │   └── run_amct_ptq.sh            # PTQ 多卡训练
@@ -43,7 +49,7 @@ qwen3_5_9b_{algo}_{scope}_{precision}.json
 
 | 字段 | 含义 | 取值 |
 |------|------|------|
-| algo | 量化算法 | rtn, rht, flatquant, lht |
+| algo | 量化算法 | rtn, rht, flatquant, omniquant, lht |
 | scope | 量化模块范围 | attn-only, mlp-only, attn-mlp |
 | precision | 精度配置 | w4a4, w4a4-w8a8-mixed |
 
@@ -58,7 +64,7 @@ qwen3_5_9b_{algo}_{scope}_{precision}.json
 
 - 配置项：无额外配置
 - scheme 名：`W4A4_MXFP4_FAKE`
-- 代码位置：`_AscendFakeMXLinearMethod`
+- 代码位置：`fake_mx_algorithms/linear.py` `FakeMXLinearMethod`
 - 无需 PTQ 训练，无需外部参数
 
 ### RHT（Randomized Hadamard Transform）
@@ -66,13 +72,14 @@ qwen3_5_9b_{algo}_{scope}_{precision}.json
 在量化前对权重和激活施加随机 Hadamard 变换，打散离群值，降低量化误差。
 
 - 配置项：
-  - `rht_seed` — 随机 sign 序列的种子（默认 0）
-  - `rht_group_size` — Hadamard 分块大小（默认同 group_size）
+  - `rht_seed` — 随机 sign 序列的种子（默认 0，与 AMCT 一致）
+  - `rht_matrix_size` — Hadamard 分块大小（默认 128，兼容回退 `rht_group_size`）
+  - `rht_params_path` — 可选；AMCT 导出的 `rht_signs` sidecar，设置后将逐层比特级校验运行时生成的 signs 与 AMCT 一致，不一致即报错
 - scheme 名：`W4A4_MXFP4_RHT_FAKE` / `W8A8_MXFP8_RHT_FAKE`
-- 代码位置：`_AscendRHTFakeMXLinearMethod`
+- 代码位置：`fake_mx_algorithms/rht.py` `RHTLinearMethod`
 - 无需 PTQ 训练，用 seed 生成随机 signs
-- 权重变换：运行时自动旋转权重（`process_weights_after_loading` 中调用 `randomized_hadamard_transform`）
-- 激活变换：`randomized_hadamard_transform(x, signs, group_size)`
+- 权重变换：加载时自动旋转权重（`prepare_weight` 中调用 `randomized_hadamard_transform`）
+- 激活变换：`randomized_hadamard_transform(x, signs, matrix_size)`
 
 ### FlatQuant
 
@@ -85,7 +92,7 @@ qwen3_5_9b_{algo}_{scope}_{precision}.json
   - `flatquant_use_diag` — 是否使用 diag_scale（默认 true）
   - `group_size` — MX 分块大小（默认 32）
 - scheme 名：`W4A4_MXFP4_FLATQUANT_FAKE` / `W8A8_MXFP8_FLATQUANT_FAKE`
-- 代码位置：`_AscendFakeMXFlatQuantLinearMethod`
+- 代码位置：`fake_mx_algorithms/flatquant.py` `FlatQuantLinearMethod`
 - 需要 PTQ 训练生成参数
 - 权重变换：`W' = inv(left) @ reshape(W) @ inv(right).T / diag_scale`
 - 激活变换：`x' = reshape(left.T @ reshape(x) @ right) * diag_scale`
@@ -108,7 +115,7 @@ qwen3_5_9b_{algo}_{scope}_{precision}.json
   - `hadamard_learning_matrix_size` — 变换矩阵大小 K（默认 128）
   - `group_size` — MX 分块大小（默认 32）
 - scheme 名：`W4A4_MXFP4_HADAMARD_LEARNING_FAKE` / `W8A8_MXFP8_HADAMARD_LEARNING_FAKE`
-- 代码位置：`_AscendHadamardLearningFakeMXLinearMethod`
+- 代码位置：`fake_mx_algorithms/lht.py` `LHTLinearMethod`
 - 需要 PTQ 训练生成参数
 - 权重变换：`W' = reshape(W, -1, K) @ inv(T).T`
 - 激活变换：`x' = reshape(x, -1, K) @ T`
@@ -147,11 +154,17 @@ model.language_memory.layers.{N}.mlp.down_proj.weight           # MLP down
 cp configs/qwen3_5_9b_rtn_attn-only_w4a4.json /path/to/model/quant_model_description.json
 
 # 启动 vllm serve
-# RTN 不需要 --enforce-eager；RHT/FlatQuant/LHT 建议加 --enforce-eager
+# 第五参数 eager（默认）用于对照；decode_graph 用于逐算法验证图模式性能
 ./scripts/serve/vllm_serve.sh /path/to/model 0 8001 configs/qwen3_5_9b_rtn_attn-only_w4a4.json
 
 # 运行评测
 python scripts/eval/run_math500.py 8001 ./outputs/rtn_attn-only_w4a4
+
+# 三数据集串行评测（smoke -> MATH-500 -> MMLU-Pro -> LiveCodeBench）
+SCENARIO=rtn_attn-only_w4a4 PORT=8001 WORK_DIR=./outputs bash scripts/eval/run_three_datasets.sh
+
+# 小样本快速验证（全量前的回归，limit 为每个子集的样本数）
+python scripts/eval/run_limited_eval.py 8001 ./outputs/rtn_quick mmlu_pro 10
 ```
 
 ### 2. FlatQuant / LHT 评测（需要 PTQ 训练）
@@ -230,7 +243,7 @@ python scripts/convert/convert_ptq_to_vllm.py \
 # 将参数文件放到模型目录（或配置中指定的路径）
 cp /data/flatquant_attn_params.safetensors /path/to/model/flatquant_params.safetensors
 
-# 启动 vllm serve（FlatQuant/LHT 必须加 --enforce-eager）
+# 启动 eager 对照；FlatQuant/LHT 的 decode_graph 需先通过一致性验证
 ./scripts/serve/vllm_serve.sh /path/to/model 0 8001 \
   configs/qwen3_5_9b_flatquant_attn-only_w4a4.json --enforce-eager
 
@@ -244,18 +257,19 @@ python scripts/eval/run_math500.py 8001 ./outputs/flatquant_attn-only_w4a4
 |--------------|------------|------|
 | `default_quant_type` | `modelslim_config.py` | 默认 scheme 名 |
 | `module_quant_overrides` | `modelslim_config.py` | glob 模式覆盖 |
-| `group_size` | `fake_mx.py` `_AscendFakeMXLinearMethod.__init__` | MX 分块大小 |
-| `fake_mx_quant_targets` | `fake_mx.py` `_AscendFakeMXLinearMethod.__init__` | 额外非 Linear 节点列表；当前仅支持 `attn-cache` |
-| `rht_seed` | `fake_mx.py` `_AscendRHTFakeMXLinearMethod.__init__` | RHT 随机种子 |
-| `rht_group_size` | `fake_mx.py` `_AscendRHTFakeMXLinearMethod.__init__` | RHT 分块大小 |
-| `flatquant_params_path` | `fake_mx.py` `_AscendFakeMXFlatQuantLinearMethod.__init__` | FlatQuant 参数文件路径 |
-| `max_supported_tp` | `fake_mx.py` `_AscendFakeMXFlatQuantLinearMethod.__init__` | FlatQuant 最大 TP |
-| `flatquant_matrix_size` | `fake_mx.py` `_AscendFakeMXFlatQuantLinearMethod.__init__` | FlatQuant AMCT 矩阵大小 K |
-| `flatquant_use_diag` | `fake_mx.py` `_AscendFakeMXFlatQuantLinearMethod.__init__` | 是否使用 diag_scale |
-| `lht_params_path` | `fake_mx.py` `_AscendHadamardLearningFakeMXLinearMethod.__init__` | LHT 参数文件路径（必填） |
-| `hadamard_learning_matrix_size` | `fake_mx.py` `_AscendHadamardLearningFakeMXLinearMethod.__init__` | LHT 矩阵大小 K |
+| `group_size` | `fake_mx_algorithms/linear.py` `FakeMXLinearMethod.__init__` | MX 分块大小（默认 32） |
+| `rht_seed` | `fake_mx_algorithms/rht.py` `RHTLinearMethod.__init__` | RHT 随机种子（默认 0） |
+| `rht_matrix_size` | `fake_mx_algorithms/rht.py` `RHTLinearMethod.__init__` | RHT Hadamard 分块大小（默认 128，兼容 `rht_group_size` 回退） |
+| `rht_params_path` | `fake_mx_algorithms/rht.py` `RHTLinearMethod.__init__` | 可选；AMCT `rht_signs` sidecar，逐层比特级校验 |
+| `flatquant_params_path` | `fake_mx_algorithms/flatquant.py` `FlatQuantLinearMethod.__init__` | FlatQuant 参数文件路径 |
+| `max_supported_tp` | `fake_mx_algorithms/flatquant.py` `FlatQuantLinearMethod.__init__` | FlatQuant 最大 TP |
+| `flatquant_matrix_size` | `fake_mx_algorithms/flatquant.py` `FlatQuantLinearMethod.__init__` | FlatQuant AMCT 矩阵大小 K |
+| `flatquant_use_diag` | `fake_mx_algorithms/flatquant.py` `FlatQuantLinearMethod.__init__` | 是否使用 diag_scale |
+| `lht_params_path` | `fake_mx_algorithms/lht.py` `LHTLinearMethod.__init__` | LHT 参数文件路径（必填） |
+| `hadamard_learning_matrix_size` | `fake_mx_algorithms/lht.py` `LHTLinearMethod.__init__` | LHT 矩阵大小 K |
+| `omniquant_params_path` | `fake_mx_algorithms/omniquant.py` `OmniQuantLinearMethod.__init__` | OmniQuant `log_scale` 参数文件路径 |
 
-> **注意**：重构后 `fake_mx_weight_state`、`auto_transform`/`auto_rotate` 系列配置项已移除。变换始终在加载时自动执行，无需手动开关。
+> **注意**：重构后 `fake_mx_weight_state`、`auto_transform`/`auto_rotate`、`fake_mx_quant_targets`（含 `attn-cache`）系列配置项已移除。非 Linear 节点不再纳入 fake-MX；变换始终在加载时自动执行，无需手动开关。
 
 ## 评测结果（Qwen3.5-9B MATH-500）
 

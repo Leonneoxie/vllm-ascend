@@ -96,7 +96,7 @@ def load_original_weights(model_dir, target):
         if not os.path.exists(path):
             continue
         with safe_open(path, framework="pt") as st:
-            for key in st.keys():
+            for key in st.keys():  # noqa: SIM118 - safe_open exposes keys(), not dict iteration.
                 if any(fk in key for fk in filter_keys) and ".weight" in key:
                     weights[key] = st.get_tensor(key)
     return weights
@@ -599,233 +599,11 @@ def _flatten_ptq_params(params, prefix=""):
     return flat
 
 
-_MERGE_MAPS = {
-    "self_attn": {"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
-    "linear_attn": {
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
-    },
-}
-
-_ACTIVATION_RENAME = {
-    "self_attn": {"inp": "qkv_proj"},
-    "linear_attn": {"inp": "in_proj_qkvz", "o_proj": "out_proj"},
-}
-
-
-def _reverse_merge(merge_maps):
-    """Build merged_name → [sub_names] lookup from all unit merge maps."""
-    reverse = {}
-    for unit_map in merge_maps.values():
-        for merged_name, split_names in unit_map.items():
-            reverse[merged_name] = split_names
-    return reverse
-
-
-_MERGE_REVERSE = _reverse_merge(_MERGE_MAPS)
-
-
-def _get_weight_shape(original_weights, layer_idx, unit_name, proj_name):
-    """Look up weight [out, in] shape, handling merged projections."""
-    sub_names = _MERGE_REVERSE.get(proj_name, [proj_name])
-    total_out = 0
-    input_size = None
-    for sn in sub_names:
-        key = f"model.language_model.layers.{layer_idx}.{unit_name}.{sn}.weight"
-        if key not in original_weights:
-            return None
-        w = original_weights[key]
-        total_out += w.shape[0]
-        input_size = w.shape[1]
-    if input_size is None:
-        return None
-    return (total_out, input_size)
-
-
-def _post_process_projections(proj_params, unit_name, is_activation):
-    """Merge split projections or rename activation projections to vllm names."""
-    if is_activation:
-        rename_map = _ACTIVATION_RENAME.get(unit_name, {})
-        return {rename_map.get(k, k): v for k, v in proj_params.items()}
-    else:
-        merge_map = _MERGE_MAPS.get(unit_name, {})
-        if not merge_map:
-            return proj_params
-        merged = {}
-        consumed = set()
-        for merged_name, split_names in merge_map.items():
-            if all(n in proj_params for n in split_names):
-                merged[merged_name] = {}
-                for param_name in proj_params[split_names[0]]:
-                    tensors = [proj_params[n][param_name] for n in split_names]
-                    merged[merged_name][param_name] = torch.cat(tensors, dim=0)
-                consumed.update(split_names)
-        for proj_name, params in proj_params.items():
-            if proj_name not in consumed:
-                merged[proj_name] = params
-        return merged
-
-
-def _convert_per_projection_attn(ptq_dir, output_path, algo_name, param_names, model_dir=None):
-    """Generic converter for per-projection algorithms (autoround/lwc/lac).
-
-    Supports two AMCT key formats:
-    - weight type: {proj}.weight_quantizer.algorithms.{algo}.{param}
-    - activation type: {proj}_afq.algorithms.{algo}.{param}
-
-    For linear_attn, merges split projections (in_proj_qkv + in_proj_z → in_proj_qkvz)
-    to match vllm's merged module names. Reshapes 'value' to weight shape if model_dir given.
-    """
-    original_weights = load_original_weights(model_dir, "attn-linear") if model_dir else {}
-    output_tensors = {}
-    for layer_idx in range(_detect_num_layers(ptq_dir)):
-        ptq = load_ptq_params(ptq_dir, layer_idx, "attn-linear")
-        if not ptq:
-            continue
-        for unit_name, params in ptq.items():
-            prefix = f"model.language_model.layers.{layer_idx}.{unit_name}"
-            flat_params = _flatten_ptq_params(params)
-            proj_params = {}
-            is_activation = False
-            for ptq_key, value in flat_params.items():
-                if not isinstance(value, torch.Tensor):
-                    continue
-                parts = ptq_key.split(".")
-                proj_name = None
-                param_name = None
-                if (
-                    len(parts) >= 5
-                    and parts[1] == "weight_quantizer"
-                    and parts[2] == "algorithms"
-                    and parts[3] == algo_name
-                ):
-                    proj_name = parts[0]
-                    param_name = ".".join(parts[4:])
-                elif (
-                    len(parts) >= 4 and parts[0].endswith("_afq") and parts[1] == "algorithms" and parts[2] == algo_name
-                ):
-                    proj_name = parts[0].removesuffix("_afq")
-                    param_name = ".".join(parts[3:])
-                    is_activation = True
-                elif (
-                    len(parts) >= 4
-                    and parts[0].endswith("_quant")
-                    and parts[1] == "algorithms"
-                    and parts[2] == algo_name
-                ):
-                    proj_name = parts[0].removesuffix("_quant")
-                    param_name = ".".join(parts[3:])
-                    is_activation = True
-                if proj_name and param_name and param_name in param_names:
-                    proj_params.setdefault(proj_name, {})[param_name] = value.clone()
-            final_params = _post_process_projections(proj_params, unit_name, is_activation)
-            for proj_name, pmap in final_params.items():
-                for param_name, value in pmap.items():
-                    if param_name == "value" and original_weights:
-                        shape = _get_weight_shape(original_weights, layer_idx, unit_name, proj_name)
-                        if shape and value.numel() == shape[0] * shape[1]:
-                            value = value.reshape(shape)
-                    out_key = f"{prefix}.{proj_name}.{param_name}"
-                    output_tensors[out_key] = value
-    save_file(output_tensors, output_path)
-    print(f"Saved {len(output_tensors)} tensors to {output_path}")
-
-
-def _convert_per_projection_mlp(ptq_dir, output_path, algo_name, param_names, model_dir=None):
-    """Generic converter for per-projection weight algorithms (mlp target)."""
-    original_weights = load_original_weights(model_dir, "mlp") if model_dir else {}
-    output_tensors = {}
-    for layer_idx in range(_detect_num_layers(ptq_dir)):
-        ptq = load_ptq_params(ptq_dir, layer_idx, "mlp")
-        if not ptq:
-            continue
-        for unit_name, params in ptq.items():
-            prefix = f"model.language_model.layers.{layer_idx}.{unit_name}"
-            flat_params = _flatten_ptq_params(params)
-            for ptq_key, value in flat_params.items():
-                parts = ptq_key.split(".")
-                if (
-                    len(parts) >= 5
-                    and parts[1] == "weight_quantizer"
-                    and parts[2] == "algorithms"
-                    and parts[3] == algo_name
-                ):
-                    proj_name = parts[0]
-                    param_name = ".".join(parts[4:])
-                    if param_name in param_names:
-                        out_value = value.clone()
-                        if param_name == "value" and original_weights:
-                            weight_key = f"{prefix}.{proj_name}.weight"
-                            if weight_key in original_weights:
-                                w = original_weights[weight_key]
-                                if out_value.numel() == w.numel():
-                                    out_value = out_value.reshape(w.shape)
-                        out_key = f"{prefix}.{proj_name}.{param_name}"
-                        output_tensors[out_key] = out_value
-    save_file(output_tensors, output_path)
-    print(f"Saved {len(output_tensors)} tensors to {output_path}")
-
-
-def convert_autoround_attn(ptq_dir, output_path, model_dir=None):
-    """转换 attn 层 AutoRound 参数。per-projection value/min_scale/max_scale."""
-    _convert_per_projection_attn(ptq_dir, output_path, "autoround", {"value", "min_scale", "max_scale"}, model_dir)
-
-
-def convert_autoround_mlp(ptq_dir, output_path, model_dir=None):
-    """转换 mlp 层 AutoRound 参数。"""
-    _convert_per_projection_mlp(ptq_dir, output_path, "autoround", {"value", "min_scale", "max_scale"}, model_dir)
-
-
-def convert_lwc_attn(ptq_dir, output_path, model_dir=None):
-    """转换 attn 层 LWC 参数。per-projection clip_factor_min/max."""
-    _convert_per_projection_attn(ptq_dir, output_path, "lwc", {"clip_factor_min", "clip_factor_max"}, model_dir)
-
-
-def convert_lwc_mlp(ptq_dir, output_path):
-    """转换 mlp 层 LWC 参数。"""
-    _convert_per_projection_mlp(ptq_dir, output_path, "lwc", {"clip_factor_min", "clip_factor_max"})
-
-
-def convert_lac_attn(ptq_dir, output_path, model_dir=None):
-    """转换 attn 层 LAC 参数。per-projection clip_factor + maxval/minval."""
-    _convert_per_projection_attn(ptq_dir, output_path, "lac", {"clip_factor_min", "clip_factor_max", "maxval", "minval"}, model_dir)
-
-
-def convert_lac_mlp(ptq_dir, output_path):
-    """转换 mlp 层 LAC 参数。
-
-    LAC mlp uses input_quant (→ gate_proj + up_proj) and hidden_quant (→ down_proj).
-    Each projection gets its own copy of clip_factor/maxval/minval.
-    """
-    output_tensors = {}
-    for layer_idx in range(_detect_num_layers(ptq_dir)):
-        ptq = load_ptq_params(ptq_dir, layer_idx, "mlp")
-        if not ptq:
-            continue
-        params = ptq["mlp"]
-        flat = _flatten_ptq_params(params)
-        quant_map = {
-            "input_quant": ["gate_proj", "up_proj"],
-            "hidden_quant": ["down_proj"],
-        }
-        for quant_key, proj_list in quant_map.items():
-            for param_name in ["clip_factor_min", "clip_factor_max", "maxval", "minval"]:
-                full_key = f"{quant_key}.algorithms.lac.{param_name}"
-                if full_key not in flat:
-                    continue
-                value = flat[full_key]
-                for proj in proj_list:
-                    prefix = f"model.language_model.layers.{layer_idx}.mlp.{proj}"
-                    output_tensors[f"{prefix}.{param_name}"] = value.clone()
-    save_file(output_tensors, output_path)
-    print(f"Saved {len(output_tensors)} tensors to {output_path}")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Convert AMCT PTQ params to vllm-ascend safetensors")
     parser.add_argument(
         "--algo",
-        choices=["flatquant", "lht", "omniquant", "autoround", "lwc", "lac"],
+        choices=["flatquant", "lht", "omniquant"],
         help="Algorithm name",
     )
     parser.add_argument("--target", choices=["attn-linear", "mlp", "moe"], help="Quant target")
@@ -867,21 +645,6 @@ def main():
             convert_omniquant_mlp(args.ptq_dir, args.output)
         elif args.target == "moe":
             convert_omniquant_moe(args.ptq_dir, args.output, args.num_experts)
-    elif args.algo == "autoround":
-        if args.target == "attn-linear":
-            convert_autoround_attn(args.ptq_dir, args.output, args.model_dir)
-        elif args.target == "mlp":
-            convert_autoround_mlp(args.ptq_dir, args.output, args.model_dir)
-    elif args.algo == "lwc":
-        if args.target == "attn-linear":
-            convert_lwc_attn(args.ptq_dir, args.output, args.model_dir)
-        elif args.target == "mlp":
-            convert_lwc_mlp(args.ptq_dir, args.output)
-    elif args.algo == "lac":
-        if args.target == "attn-linear":
-            convert_lac_attn(args.ptq_dir, args.output, args.model_dir)
-        elif args.target == "mlp":
-            convert_lac_mlp(args.ptq_dir, args.output)
 
 
 if __name__ == "__main__":
