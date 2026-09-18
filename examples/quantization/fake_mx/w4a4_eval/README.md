@@ -10,6 +10,7 @@
 ```
 w4a4_eval/
 ├── README.md                          # 本文档
+├── baseline-results.md                # W4A4 精度基线（64 单元完整矩阵）
 ├── quick-verify-guide.md              # 快速验证方案（Level 子集）
 ├── configs/                           # 19 个量化配置文件
 │   ├── qwen3_5_9b_rtn_attn-only_w4a4.json
@@ -271,43 +272,37 @@ python scripts/eval/run_math500.py 8001 ./outputs/flatquant_attn-only_w4a4
 
 > **注意**：重构后 `fake_mx_weight_state`、`auto_transform`/`auto_rotate`、`fake_mx_quant_targets`（含 `attn-cache`）系列配置项已移除。非 Linear 节点不再纳入 fake-MX；变换始终在加载时自动执行，无需手动开关。
 
-## 评测结果（Qwen3.5-9B MATH-500）
+## 评测结果（Qwen3.5-9B）
 
-### 全 W4A4 矩阵
+完整 64 单元精度基线（16 场景 × 4 指标：PPL / MATH-500 / MMLU-Pro / LiveCodeBench）见 [baseline-results.md](./baseline-results.md)。
+
+### MATH-500 摘要（全 W4A4，采样解码契约）
 
 | 算法 | attn-only | mlp-only | attn-mlp |
 |------|-----------|----------|----------|
-| RTN | 86.20% | 92.60% | 77.40% |
-| RHT | 89.20% | 90.60% | 79.60% |
-| FlatQuant | 92.40% | 94.40% | 91.20% |
-| LHT | 93.00% | 93.00% | 92.80% |
+| RTN | 86.4% | 92.0% | 79.0% |
+| RHT | 86.6% | 93.2% | 80.6% |
+| FlatQuant | 92.4% | 94.0% | 91.0% |
+| OmniQuant | 93.0% | 92.6% | 91.6% |
+| LHT | 88.4% | 93.2% | 88.0% |
 
-BF16 基线：93.80%
+BF16 基线：94.0%
 
-### Mixed W4A4/W8A8（attn-only）
-
-| RTN | RHT | FlatQuant | LHT |
-|------|-----|-----------|-----|
-| 89.80% | 91.60% | 92.60% | 93.00% |
-
-### 重构后 Level3 快速验证（2026-08-11）
-
-| 算法 | 全量 Level3 | 重构后 Level3 | 差值 | 状态 |
-|------|------------|-------------|------|------|
-| LHT | 97.14% | 97.14% | 0% | ✅ 一致 |
-| FlatQuant | 97.14% | 99.05% | +1.91% | ✅ 无回归 |
+> 解码契约：`do_sample=true, temperature=1.0, top_k=20, top_p=0.95, seed=42`（与 `scripts/eval/` 全量脚本一致）。历史文档中的确定性解码数字（如 BF16 93.8%）及 bug 时代 RHT 数据已作废，不可与本表比较。
 
 ### 关键结论
 
-1. **LHT 在所有场景均最优或并列最优**，attn-only 全 W4A4 达到 93.0%（仅 -0.8% vs BF16）
-2. **FlatQuant mlp-only 94.4% 超越 BF16 基线**，MLP 量化后精度反而提升
-3. **attn 是 W4A4 的主要损失来源**：RTN attn-only -7.6% vs mlp-only -1.2%
-4. **学习型变换（FlatQuant/LHT）收益巨大**：attn-mlp 场景 RTN 77.4% → LHT 92.8%（+15.4%）
-5. **RHT 对 mlp 反而有负面影响**：RTN mlp 92.6% → RHT mlp 90.6%（-2.0%），随机变换引入噪声
+1. **FlatQuant 数据集综合最优**：attn-mlp 场景 MMLU-Pro 77.5% / LCB 53.2% 为五算法最佳；mlp-only MATH-500 94.0% 追平 BF16、LCB 58.7% 反超 BF16
+2. **学习型变换 PPL 可低于 BF16**：LHT attn 7.801、FlatQuant attn 7.812 / attn-mlp 7.972（BF16 为 8.171）
+3. **RHT 零训练成本抑制离群值**：vs RTN，PPL attn 9.30→8.03、attn-mlp 9.56→8.65；mlp-only 数据集净收益（MATH-500 +1.2pt、LCB +1.3pt）
+4. **attn 是 W4A4 主要损失源**：RTN vs BF16，attn-only MATH-500 -7.6pt / LCB -18.2pt（mlp-only 仅 -2.0pt / -8.3pt）
+5. **学习型变换全量化收益 +12pt 级**：attn-mlp MATH-500，RTN 79.0% → OmniQuant 91.6% / FlatQuant 91.0%
+
+Level3 快速验证方案见 [quick-verify-guide.md](./quick-verify-guide.md)。
 
 ## 环境要求
 
-- vllm-ascend 分支：`w4a4-quant-eval-results`
+- vllm-ascend 分支：`fake-mx-lite`
 - CANN >= 9.0.1
 - Ascend 910 NPU
 - AMCT PTQ 训练需独立 conda 环境（amct_pytorch）
