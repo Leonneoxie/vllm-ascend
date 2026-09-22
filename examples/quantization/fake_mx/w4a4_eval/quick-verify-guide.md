@@ -13,49 +13,14 @@ evalscope 的 math_500 数据集支持 `subset_list` 指定只跑某个 Level �
 
 **推荐 Level 3**：题量适中（105题，~10min/场景），区分度高，对量化误差敏感。
 
-### 验证结果历史
-
-| 日期 | 算法 | Level3 分数 | 基线 | 差值 | 说明 |
-|------|------|-----------|------|------|------|
-| 2026-08-11 | RTN | 91.43% | 92.38% | -0.95% | 9 处修复后验证 |
-| 2026-08-11 | FlatQuant | 96.19% | 97.14% | -0.95% | 9 处修复后验证 |
-| 2026-08-11 | LHT | 96.19% | 97.14% | -0.95% | 9 处修复后验证 |
-| 2026-08-11 | LHT | 97.14% | 97.14% | 0% | 重构后验证 |
-| 2026-08-11 | FlatQuant | 99.05% | 97.14% | +1.91% | 重构后验证 |
-
 ## 二、验证脚本
 
-使用 evalscope 的 `dataset_args` 参数只跑指定 Level 子集：
-
-```python
-from evalscope import run_task, TaskConfig
-
-task = TaskConfig(
-    model="qwen3.5",
-    model_id="qwen3.5",
-    api_url=f"http://localhost:{port}/v1/chat/completions",
-    api_key="EMPTY",
-    datasets=["math_500"],
-    eval_type="openai_api",
-    eval_batch_size=32,
-    dataset_args={"math_500": {"subset_list": ["Level 3"]}},
-    generation_config={
-        "batch_size": 32,
-        "max_tokens": 8192,
-        "n": 1,
-        "stream": True,
-        "temperature": 1.0,
-        "top_k": 20,
-        "top_p": 0.95,
-        "do_sample": True,
-        "timeout": 600,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-    },
-    work_dir=work_dir,
-    seed=42,
-)
-run_task(task)
+```bash
+python scripts/eval/run_level3_verify.py <port> <work_dir>
+# 示例: python scripts/eval/run_level3_verify.py 8008 ./outputs/verify_fq_attn
 ```
+
+生成配置与全量脚本完全一致（`do_sample=true, temperature=1.0, top_k=20, top_p=0.95, seed=42`），仅限 Level 3 子集。
 
 ## 三、并行验证流程
 
@@ -65,7 +30,7 @@ run_task(task)
 2. **不需要在 model name 里加 port**——统一用 `--served-model-name qwen3.5`
 3. **vllm 加载完配置后不再读文件**——可以安全替换配置文件
 4. **时序错开是必须的**：必须等前一个 vllm 完全加载完配置（日志出现 "Loaded N fake-MX transform params"）后，才能替换配置文件启动下一个
-5. **FlatQuant/LHT 必须 `--enforce-eager`**
+5. **先以 eager 建立对照，再逐算法验证 decode_graph**：FlatQuant/LHT 图模式兼容性尚需实测；启动脚本第五参数可传 `decode_graph`。不能同时传 `--enforce-eager` 和图配置。通过输出一致性和性能验证后，再在完整测评使用图模式。
 6. **不要用 heredoc 创建 JSON 配置**——shell 会吃掉引号。用 python json.dump 或 scp 传输
 
 ### 步骤
@@ -82,7 +47,7 @@ curl -s http://localhost:8008/v1/models | head -1  # 返回 JSON 即就绪
 grep "Loaded.*fake-MX.*transform" serve.log  # 必须有 "Loaded N fake-MX transform params" 日志
 
 # 3. 启动 FlatQuant 评测
-python run_level_only.py 8008 ./outputs/verify_fq 3 &
+python scripts/eval/run_level3_verify.py 8008 ./outputs/verify_fq &
 
 # 4. 等 FlatQuant 评测开始跑（确认有进度），替换配置为 LHT
 cp configs/qwen3_5_9b_lht_attn-only_w4a4.json /path/to/model/quant_model_description.json
@@ -95,7 +60,7 @@ ASCEND_RT_VISIBLE_DEVICES=7 vllm serve /path/to/model \
 grep "Loaded.*fake-MX.*transform" serve.log  # "Loaded 88 fake-MX transform params"
 
 # 6. 启动 LHT 评测
-python run_level_only.py 8009 ./outputs/verify_lht 3 &
+python scripts/eval/run_level3_verify.py 8009 ./outputs/verify_lht &
 ```
 
 ### 验证参数加载（必须检查）

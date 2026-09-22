@@ -32,7 +32,7 @@ import time
 import pytest
 import torch
 
-from vllm_ascend.ops.fused_moe.moe_mlp import (
+from vllm_ascend.quantization.methods.fake_mx_algorithms.expert_transforms import (
     _apply_expert_flatquant,
     _apply_expert_learned_hadamard,
 )

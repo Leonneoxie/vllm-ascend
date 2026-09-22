@@ -7,16 +7,13 @@
 环境要求:
   conda activate evalscope  (evalscope 1.10.0, pyarrow 19.0.1, ms-enclave 0.0.8)
   需有 docker 和 python:3.11-slim 镜像
-  vllm serve 需在 vllm-qwen35-9b-x 容器中以 host 网络模式启动
+  vllm serve 需已启动并可从本机访问
 
 数据集缓存:
-  MODELSCOPE_CACHE=/data2/x00823151/datasets (已下载)
+  可选设置 MODELSCOPE_CACHE 指向已下载的数据集目录
 """
 
-import os
 import sys
-
-os.environ.setdefault("MODELSCOPE_CACHE", "/data2/x00823151/datasets")
 
 from evalscope import TaskConfig, run_task
 

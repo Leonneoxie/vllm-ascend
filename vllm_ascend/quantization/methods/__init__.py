@@ -32,8 +32,6 @@ from typing import Any
 # Import base classes
 from .base import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, QuantType
 from .fake_mx import (
-    AscendW4A4MXFP4AutoRoundFakeFusedMoEMethod,
-    AscendW4A4MXFP4AutoRoundFakeLinearMethod,
     AscendW4A4MXFP4FakeFlatQuantFusedMoEMethod,
     AscendW4A4MXFP4FakeFlatQuantLinearMethod,
     AscendW4A4MXFP4FakeFusedMoEMethod,
@@ -44,8 +42,6 @@ from .fake_mx import (
     AscendW4A4MXFP4OmniQuantFakeLinearMethod,
     AscendW4A4MXFP4RHTFakeFusedMoEMethod,
     AscendW4A4MXFP4RHTFakeLinearMethod,
-    AscendW8A8MXFP8AutoRoundFakeFusedMoEMethod,
-    AscendW8A8MXFP8AutoRoundFakeLinearMethod,
     AscendW8A8MXFP8FakeFlatQuantFusedMoEMethod,
     AscendW8A8MXFP8FakeFlatQuantLinearMethod,
     AscendW8A8MXFP8FakeFusedMoEMethod,
@@ -146,8 +142,4 @@ __all__ = [
     "AscendW8A8MXFP8HadamardLearningFakeLinearMethod",
     "AscendW4A4MXFP4HadamardLearningFakeFusedMoEMethod",
     "AscendW8A8MXFP8HadamardLearningFakeFusedMoEMethod",
-    "AscendW4A4MXFP4AutoRoundFakeLinearMethod",
-    "AscendW8A8MXFP8AutoRoundFakeLinearMethod",
-    "AscendW4A4MXFP4AutoRoundFakeFusedMoEMethod",
-    "AscendW8A8MXFP8AutoRoundFakeFusedMoEMethod",
 ]
