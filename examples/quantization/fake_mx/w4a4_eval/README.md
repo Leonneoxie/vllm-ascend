@@ -11,8 +11,10 @@
 w4a4_eval/
 ├── README.md                          # 本文档
 ├── baseline-results.md                # W4A4 精度基线（64 单元完整矩阵）
+├── baseline-guide.md                  # 基线复测与新算法接入指导
 ├── quick-verify-guide.md              # 快速验证方案（Level 子集）
-├── configs/                           # 19 个量化配置文件（命名规则见下）
+├── configs/                           # 量化配置文件（命名规则见下；另含 qwen3_6_35b（MoE）等其他规模模型配置）
+├── params/                            # 基线复测参数归档（LFS，清单见 params/README.md）
 └── scripts/
     ├── serve/vllm_serve.sh            # vllm serve 启动脚本
     ├── eval/run_math500.py            # MATH-500 评测
@@ -67,13 +69,14 @@ qwen3_5_9b_{algo}_{scope}_{precision}.json
 - 代码位置：`fake_mx_algorithms/flatquant.py`
 - 参数文件格式（safetensors）：
   ```
-  {prefix}.weight           — 变换后的 FP 权重 [out, in]
   {prefix}.left_trans       — 左变换矩阵 [L, L]
   {prefix}.right_trans      — 右变换矩阵 [R, R]
-  {prefix}.clip_ratio       — 裁剪比例 [1] (float32, 值=1.0)
   {prefix}.diag_scale       — 对角缩放 [L*R] (float32, 可选)
   ```
   其中 L*R = in_features，L 和 R 由 AMCT 训练确定
+
+  sidecar仅提供变换参数；模型仍加载原始BF16权重，在vLLM加载期完成权重逆变换。
+  `clip_ratio`由运行时初始化为1.0，不需预变换权重或同名sidecar字段。
 
 ### OmniQuant
 
@@ -139,75 +142,85 @@ python scripts/eval/run_limited_eval.py 8001 ./outputs/rtn_quick mmlu_pro 10
 
 ```bash
 # attn 层校准数据
-./scripts/ptq/extract_ptq_data.sh /path/to/model /data/ptq_data attn-linear 0
+./scripts/ptq/extract_ptq_data.sh /path/to/model /path/to/ptq_data attn-linear 0
 
 # mlp 层校准数据
-./scripts/ptq/extract_ptq_data.sh /path/to/model /data/ptq_data mlp 1
+./scripts/ptq/extract_ptq_data.sh /path/to/model /path/to/ptq_data mlp 1
 ```
 
 #### 2.2 PTQ 训练（8 卡并行）
 
+先激活 AMCT 运行环境。脚本默认使用 `$AMCT_ROOT/amct_pytorch/configs/w4a4.yaml`，
+可用第六个位置参数指定其他 bit_config。
+训练参数为 epochs=15、base_lr=1e-3、cali_bsz=4、nsamples=128、k_size=128、adamw、cosine。
+脚本检查 AMCT 可导入及生成的参数文件数量是否为32，不替代层号覆盖和参数内容检查。
+
 ```bash
+export AMCT_ROOT=/absolute/path/to/amct
+
 # FlatQuant attn 训练
-./scripts/ptq/run_amct_ptq.sh flatquant attn-linear /path/to/model /data/ptq_data /data/ptq_fq_attn
+./scripts/ptq/run_amct_ptq.sh flatquant attn-linear /path/to/model /path/to/ptq_data /path/to/ptq_fq_attn
 
 # LHT attn 训练
-./scripts/ptq/run_amct_ptq.sh learnable_had attn-linear /path/to/model /data/ptq_data /data/ptq_lht_attn
+./scripts/ptq/run_amct_ptq.sh learnable_had attn-linear /path/to/model /path/to/ptq_data /path/to/ptq_lht_attn
 
 # FlatQuant mlp 训练
-./scripts/ptq/run_amct_ptq.sh flatquant mlp /path/to/model /data/ptq_data /data/ptq_fq_mlp
+./scripts/ptq/run_amct_ptq.sh flatquant mlp /path/to/model /path/to/ptq_data /path/to/ptq_fq_mlp
 
 # LHT mlp 训练
-./scripts/ptq/run_amct_ptq.sh learnable_had mlp /path/to/model /data/ptq_data /data/ptq_lht_mlp
+./scripts/ptq/run_amct_ptq.sh learnable_had mlp /path/to/model /path/to/ptq_data /path/to/ptq_lht_mlp
 ```
 
 #### 2.3 转换参数
 
+FlatQuant 转换器当前要求 `--model_dir`，但 sidecar 仅导出变换参数，不导出变换后的模型权重。
+权重变换由 vLLM 加载阶段完成。
+
 ```bash
-# FlatQuant attn 参数（需要模型权重做权重变换）
+# FlatQuant attn 参数
 python scripts/convert/convert_ptq_to_vllm.py \
   --algo flatquant --target attn-linear \
-  --ptq_dir /data/ptq_fq_attn/ptq_params/qwen3_5/attn-linear \
+  --ptq_dir /path/to/ptq_fq_attn/ptq_params/qwen3_5/attn-linear \
   --model_dir /path/to/model \
-  --output /data/flatquant_attn_params.safetensors
+  --output /path/to/flatquant_attn_params.safetensors
 
 # FlatQuant mlp 参数
 python scripts/convert/convert_ptq_to_vllm.py \
   --algo flatquant --target mlp \
-  --ptq_dir /data/ptq_fq_mlp/ptq_params/qwen3_5/mlp \
+  --ptq_dir /path/to/ptq_fq_mlp/ptq_params/qwen3_5/mlp \
   --model_dir /path/to/model \
-  --output /data/flatquant_mlp_params.safetensors
+  --output /path/to/flatquant_mlp_params.safetensors
 
 # 合并 attn + mlp 参数（用于 attn-mlp 场景）
 python scripts/convert/convert_ptq_to_vllm.py \
-  --merge /data/flatquant_attn_params.safetensors \
-          /data/flatquant_mlp_params.safetensors \
-          /data/flatquant_attn_mlp_params.safetensors
+  --merge /path/to/flatquant_attn_params.safetensors \
+          /path/to/flatquant_mlp_params.safetensors \
+          /path/to/flatquant_attn_mlp_params.safetensors
 
 # LHT attn 参数（不需要模型权重）
 python scripts/convert/convert_ptq_to_vllm.py \
   --algo lht --target attn-linear \
-  --ptq_dir /data/ptq_lht_attn/ptq_params/qwen3_5/attn-linear \
-  --output /data/lht_attn_params.safetensors
+  --ptq_dir /path/to/ptq_lht_attn/ptq_params/qwen3_5/attn-linear \
+  --output /path/to/lht_attn_params.safetensors
 
 # LHT mlp 参数
 python scripts/convert/convert_ptq_to_vllm.py \
   --algo lht --target mlp \
-  --ptq_dir /data/ptq_lht_mlp/ptq_params/qwen3_5/mlp \
-  --output /data/lht_mlp_params.safetensors
+  --ptq_dir /path/to/ptq_lht_mlp/ptq_params/qwen3_5/mlp \
+  --output /path/to/lht_mlp_params.safetensors
 
 # 合并 LHT attn + mlp
 python scripts/convert/convert_ptq_to_vllm.py \
-  --merge /data/lht_attn_params.safetensors \
-          /data/lht_mlp_params.safetensors \
-          /data/lht_attn_mlp_params.safetensors
+  --merge /path/to/lht_attn_params.safetensors \
+          /path/to/lht_mlp_params.safetensors \
+          /path/to/lht_attn_mlp_params.safetensors
 ```
 
 #### 2.4 部署参数并评测
 
 ```bash
 # 将参数文件放到模型目录（或配置中指定的路径）
-cp /data/flatquant_attn_params.safetensors /path/to/model/flatquant_params.safetensors
+cp /path/to/flatquant_attn_params.safetensors /path/to/model/flatquant_params.safetensors
 
 # 启动 eager 对照；FlatQuant/LHT 的 decode_graph 需先通过一致性验证
 ./scripts/serve/vllm_serve.sh /path/to/model 0 8001 \
@@ -239,7 +252,8 @@ python scripts/eval/run_math500.py 8001 ./outputs/flatquant_attn-only_w4a4
 
 ## 评测结果（Qwen3.5-9B）
 
-完整 64 单元精度基线（16 场景 × 4 指标：PPL / MATH-500 / MMLU-Pro / LiveCodeBench）见 [baseline-results.md](./baseline-results.md)。
+完整 64 单元精度基线（16 场景 × 4 指标：PPL / MATH-500 / MMLU-Pro / LiveCodeBench）见 [baseline-results.md](./baseline-results.md)；
+基线复测与新算法接入流程见 [baseline-guide.md](./baseline-guide.md)。
 
 ### MATH-500 摘要（全 W4A4，采样解码契约）
 
@@ -247,7 +261,7 @@ python scripts/eval/run_math500.py 8001 ./outputs/flatquant_attn-only_w4a4
 |------|-----------|----------|----------|
 | RTN | 86.4% | 92.0% | 79.0% |
 | RHT | 86.6% | 93.2% | 80.6% |
-| FlatQuant | 92.4% | 94.0% | 91.0% |
+| FlatQuant | 92.4% | 93.4% | 91.0% |
 | OmniQuant | 93.0% | 92.6% | 91.6% |
 | LHT | 88.4% | 93.2% | 88.0% |
 
@@ -257,7 +271,7 @@ BF16 基线：94.0%
 
 ### 关键结论
 
-1. **FlatQuant 数据集综合最优**：attn-mlp 场景 MMLU-Pro 77.5% / LCB 53.2% 为五算法最佳；mlp-only MATH-500 94.0% 追平 BF16、LCB 58.7% 反超 BF16
+1. **FlatQuant 数据集综合表现较好**：attn-mlp 场景 MMLU-Pro 77.5% / LCB 53.2% 为五算法最佳；归档mlp-only参数的MATH-500为93.4%、LCB为58.77%，接近BF16
 2. **学习型变换 PPL 可低于 BF16**：LHT attn 7.801、FlatQuant attn 7.812 / attn-mlp 7.972（BF16 为 8.171）
 3. **RHT 零训练成本抑制离群值**：vs RTN，PPL attn 9.30→8.03、attn-mlp 9.56→8.65；mlp-only 数据集净收益（MATH-500 +1.2pt、LCB +1.3pt）
 4. **attn 是 W4A4 主要损失源**：RTN vs BF16，attn-only MATH-500 -7.6pt / LCB -18.2pt（mlp-only 仅 -2.0pt / -8.3pt）
