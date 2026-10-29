@@ -4,7 +4,7 @@
 #   algo:         flatquant | omniquant | learnable_had
 #   quant_target: attn-linear | mlp
 #   bit_config:   可选，默认 $AMCT_ROOT/amct_pytorch/configs/w4a4.yaml
-# 统一训练口径: epochs 15 / base_lr 1e-3 / cali_bsz 4 / nsamples 128 / k_size 128 / adamw / cosine
+# 统一训练口径: epochs 15 / base_lr 1e-3 / cali_bsz 4 / nsamples 128 / matrix_size 128 / adamw / cosine
 # AMCT 运行环境（CANN env、依赖安装）见 AMCT 仓自带说明。
 # 可选环境变量: NPU_TASKS（默认 8）、NPU_CARDS（默认 "0 1 2 3 4 5 6 7"，空格分隔）
 set -e
@@ -45,7 +45,7 @@ for ((i=0; i<NUM_TASKS; i++)); do
     --quant_target "$TARGET" --quant_dtype mxfp --bit_config "$BIT_CONFIG" \
     --algos "$ALGO" --output_dir "$OUTPUT_DIR" \
     --epochs 15 --base_lr 1e-3 --cali_bsz 4 --nsamples 128 \
-    --k_size 128 --optimizer adamw --lr_scheduler cosine \
+    --matrix_size 128 --optimizer adamw --lr_scheduler cosine \
     > "$OUTPUT_DIR/logs/ptq_${ALGO}_${TARGET}_card${npu}.log" 2>&1 &
   PIDS="$PIDS $!"
   start=$end

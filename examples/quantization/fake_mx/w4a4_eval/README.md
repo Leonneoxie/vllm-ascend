@@ -152,7 +152,7 @@ python scripts/eval/run_limited_eval.py 8001 ./outputs/rtn_quick mmlu_pro 10
 
 先激活 AMCT 运行环境。脚本默认使用 `$AMCT_ROOT/amct_pytorch/configs/w4a4.yaml`，
 可用第六个位置参数指定其他 bit_config。
-训练参数为 epochs=15、base_lr=1e-3、cali_bsz=4、nsamples=128、k_size=128、adamw、cosine。
+训练参数为 epochs=15、base_lr=1e-3、cali_bsz=4、nsamples=128、matrix_size=128、adamw、cosine。
 脚本检查 AMCT 可导入及生成的参数文件数量是否为32，不替代层号覆盖和参数内容检查。
 
 ```bash
