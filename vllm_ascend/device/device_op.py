@@ -1016,6 +1016,31 @@ class BaseDeviceAdaptor:
         return tensor
 
 
+# =====================================================================
+# A5 attention implementation switch (experimental, hardcoded).
+#
+# Set to "FA" or "QFA" to replace the eager FIA call inside
+# A5DeviceAdaptor.npu_fused_infer_attention_score with the ops-transformer
+# mainline custom op (requires the cann_ops_transformer torch extension):
+#   "FIA": default, original torch_npu.npu_fused_infer_attention_score path.
+#   "FA" : cann_ops_transformer.flash_attn (BF16). Fresh prefill uses TND
+#          layouts; decode / prefix-cache batches read the KV cache
+#          directly as PA_BBND (num_blocks, block_size, kv_heads, head_dim)
+#          plus block_table, no gather.
+#   "QFA": cann_ops_transformer.quant_flash_attn, quant_mode=1 (MxFP8,
+#          softmax FP32). Fresh prefill only (block_table is None); Q/K/V
+#          are quantized online via torch_npu.npu_dynamic_mx_quant. Paged
+#          batches fall back to FIA because the KV cache is BF16.
+#
+# Only the eager path is covered: graph capture (full_graph_fia /
+# full_graph_fia_v2 in attention_v1.py) calls torch_npu directly and is
+# NOT affected by this switch.
+# =====================================================================
+A5_ATTENTION_IMPL = "FIA"
+
+_A5_CAUSAL_MASK_MODE = 3  # mask_mode=CAUSAL for flash_attn / quant_flash_attn
+
+
 class A5DeviceAdaptor(BaseDeviceAdaptor):
     @staticmethod
     def _scatter_cache(var, indices, updates) -> bool:
@@ -1094,6 +1119,36 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         is_prefill_no_cache: bool,
         **kwargs,
     ):
+        causal = kwargs.get("sparse_mode", 3) == 3
+        if A5_ATTENTION_IMPL == "FA" and causal:
+            fa_result = cls._a5_flash_attn(
+                query,
+                key,
+                value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                num_heads=num_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_size=head_size,
+                scale=scale,
+                **kwargs,
+            )
+            if fa_result is not None:
+                return fa_result
+        if A5_ATTENTION_IMPL == "QFA" and causal:
+            qfa_result = cls._a5_quant_flash_attn(
+                query,
+                key,
+                value,
+                num_heads=num_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_size=head_size,
+                scale=scale,
+                **kwargs,
+            )
+            if qfa_result is not None:
+                return qfa_result
+
         if kwargs.get("block_table") is None:
             key = key.contiguous()
             value = value.contiguous()
@@ -1107,6 +1162,279 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             scale=scale,
             **kwargs,
         )
+
+    @classmethod
+    def _a5_flash_attn(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        key_cache: torch.Tensor | None,
+        value_cache: torch.Tensor | None,
+        num_heads: int,
+        num_key_value_heads: int,
+        head_size: int,
+        scale: float,
+        **kwargs,
+    ):
+        """Eager causal attention via mainline flash_attn (BF16).
+
+        Fresh prefill runs TND; decode / prefix-cache batches feed the KV
+        cache directly as PA_BBND with block_table (no gather). Returns None
+        to fall back to FIA when a paged batch has no cache tensors.
+        """
+        cann_ops = cls._a5_import_cann_ops("FA")
+
+        block_table = kwargs.get("block_table")
+        cu_seqlens_q = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths"), query.device)
+        attn_mask = cls._a5_causal_mask_int8(kwargs.get("atten_mask"))
+        if attn_mask is None:
+            # mask_mode=3 requires the optimized mask; fall back to FIA
+            # instead of guessing a replacement.
+            return None
+
+        if block_table is not None:
+            if key_cache is None or value_cache is None:
+                return None
+            # Default cache layout (num_blocks, block_size, N, D) is PA_BBND;
+            # the LBHNC variant (num_blocks, N, block_size, D) is PA_BNBD.
+            if key_cache.dim() == 4:
+                layout_kv = "PA_BBND" if key_cache.shape[2] == kwargs.get("block_size") else "PA_BNBD"
+                kv, vv = key_cache, value_cache
+            else:
+                # 3D cache stores merged heads (num_blocks, block_size, N * D).
+                layout_kv = "PA_BBND"
+                kv = key_cache.view(key_cache.shape[0], key_cache.shape[1], num_key_value_heads, head_size)
+                vv = value_cache.view(value_cache.shape[0], value_cache.shape[1], num_key_value_heads, head_size)
+            seqused_kv = cls._a5_seqused(kwargs.get("actual_seq_lengths_kv"), query.device)
+            cu_seqlens_kv = None
+        else:
+            layout_kv = "TND"
+            kv = key.contiguous()
+            vv = value.contiguous()
+            seqused_kv = None
+            cu_seqlens_kv = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths_kv"), query.device)
+
+        metadata = cann_ops.flash_attn_metadata(
+            num_heads,
+            num_key_value_heads,
+            head_size,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            cu_seqlens_kv=cu_seqlens_kv,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_kv=layout_kv,
+            layout_out="TND",
+        )
+        attn_out, _ = cann_ops.flash_attn(
+            query.contiguous(),
+            kv,
+            vv,
+            block_table=block_table.to(torch.int32) if block_table is not None else None,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            cu_seqlens_kv=cu_seqlens_kv,
+            metadata=metadata,
+            softmax_scale=scale,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            attn_mask=attn_mask,
+            layout_q="TND",
+            layout_kv=layout_kv,
+            layout_out="TND",
+            return_softmax_lse=False,
+        )
+        return attn_out, None
+
+    @classmethod
+    def _a5_quant_flash_attn(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        num_heads: int,
+        num_key_value_heads: int,
+        head_size: int,
+        scale: float,
+        **kwargs,
+    ):
+        """Eager causal prefill via mainline quant_flash_attn (MxFP8, quant_mode=1).
+
+        Q/K/V are quantized online with torch_npu.npu_dynamic_mx_quant
+        (3D input, axis=-1 for Q/K and axis=0 for V). Returns None to fall
+        back to FIA for paged batches: the BF16 KV cache cannot feed
+        quant_flash_attn, which requires MxFP8 KV plus e8m0 descales.
+        """
+        if kwargs.get("block_table") is not None:
+            return None
+        cann_ops = cls._a5_import_cann_ops("QFA")
+
+        cu_seqlens_q = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths"), query.device)
+        cu_seqlens_kv = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths_kv"), query.device)
+        attn_mask = cls._a5_causal_mask_int8(kwargs.get("atten_mask"))
+        if attn_mask is None:
+            # mask_mode=3 requires the optimized mask; fall back to FIA
+            # instead of guessing a replacement.
+            return None
+
+        q8, q_descale = cls._a5_mx_quant_qk(query)
+        k8, k_descale = cls._a5_mx_quant_qk(key)
+        v8, v_descale = cls._a5_mx_quant_v(value, cu_seqlens_kv)
+
+        metadata = cann_ops.quant_flash_attn_metadata(
+            num_heads,
+            num_key_value_heads,
+            head_size,
+            1,  # quant_mode=1: A8C8_QKV_MXFP8_P_FP8_E4M3_PER_TENSOR_SOFTMAX_FP32
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_q_descale="TND",
+            layout_kv="TND",
+            layout_out="TND",
+        )
+        attn_out, _ = cann_ops.quant_flash_attn(
+            q8,
+            k8,
+            v8,
+            q_descale,
+            k_descale,
+            v_descale,
+            1,  # quant_mode=1
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            attn_mask=attn_mask,
+            metadata=metadata,
+            softmax_scale=scale,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_q_descale="TND",
+            layout_kv="TND",
+            layout_out="TND",
+            return_softmax_lse=False,
+        )
+        return attn_out, None
+
+    @staticmethod
+    def _a5_import_cann_ops(impl: str):
+        try:
+            import cann_ops_transformer
+        except ImportError as e:
+            raise RuntimeError(
+                f"A5_ATTENTION_IMPL='{impl}' requires the cann_ops_transformer torch "
+                "extension built from ops-transformer attention/flash_attn and "
+                "attention/quant_flash_attn."
+            ) from e
+        return cann_ops_transformer
+
+    @staticmethod
+    def _a5_cu_seqlens(actual_seq_lengths, device: torch.device) -> torch.Tensor:
+        """[B] cumulative lengths (FIA convention, no leading zero) -> [B+1] int32."""
+        if isinstance(actual_seq_lengths, torch.Tensor):
+            seq = actual_seq_lengths.to(torch.int32).flatten()
+        else:
+            seq = torch.tensor(list(actual_seq_lengths), dtype=torch.int32, device=device)
+        zero = torch.zeros(1, dtype=torch.int32, device=seq.device)
+        return torch.cat([zero, seq])
+
+    @staticmethod
+    def _a5_seqused(seq_lens, device: torch.device) -> torch.Tensor:
+        """Per-request lengths -> (B,) int32."""
+        if isinstance(seq_lens, torch.Tensor):
+            return seq_lens.to(torch.int32).flatten()
+        return torch.tensor(list(seq_lens), dtype=torch.int32, device=device)
+
+    @staticmethod
+    def _a5_causal_mask_int8(atten_mask):
+        """Normalize the FIA causal mask to int8 (2048, 2048): nonzero=masked.
+
+        FA/QFA expect the same encoding the tests build via
+        triu(ones, diagonal=1) int8, which matches the FIA sparse_mode=3
+        optimized mask. Comparing != 0 first avoids undefined casts
+        (e.g. fp16 masks encode masked positions as -inf).
+        """
+        if atten_mask is None:
+            return None
+        mask = (atten_mask != 0).to(torch.int8)
+        if mask.dim() > 2:
+            mask = mask.reshape(-1, mask.shape[-2], mask.shape[-1])[0]
+        return mask
+
+    @staticmethod
+    def _a5_scale_to_e8m0_u8(scale: torch.Tensor) -> torch.Tensor:
+        """Normalize the mxscale returned by npu_dynamic_mx_quant to uint8 bytes.
+
+        Per the op-plugin doc the op returns uint8 (raw e8m0 bytes); some
+        runtimes may instead return float8_e8m0fnu or fp32 values.
+        """
+        if scale.dtype == torch.uint8:
+            return scale
+        if scale.dtype == torch_npu.float8_e8m0fnu:
+            return scale.view(torch.uint8)
+        exponent = torch.round(torch.log2(scale.clamp_min(2.0**-127)))
+        return exponent.clamp_(0, 254).to(torch.uint8)
+
+    @classmethod
+    def _a5_mx_quant_qk(cls, x: torch.Tensor):
+        """MxFP8-quantize Q/K (T, N, D): per-token 32-element groups along D.
+
+        npu_dynamic_mx_quant (axis=-1, block_size=32, scale_alg=0) already
+        returns mxscale in the exact QFA TND descale layout: rank+1 with a
+        trailing 2, i.e. (T, N, ceil(D/64), 2).
+        Returns fp8 data (T, N, D) and e8m0 descale (T, N, ceil(D/64), 2).
+        """
+        t, n, d = x.shape
+        x8, scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn, axis=-1)
+        scale_u8 = cls._a5_scale_to_e8m0_u8(scale)
+        if scale_u8.dim() == 4:
+            descale = scale_u8.contiguous()
+        else:
+            # Legacy runtimes returning (T, N, groups) or (T*N, groups):
+            # pair adjacent groups into the trailing (..., 2).
+            num_groups = scale_u8.numel() // (t * n)
+            descale = scale_u8.reshape(t, n, num_groups // 2, 2).contiguous()
+        return x8, descale.view(torch_npu.float8_e8m0fnu)
+
+    @classmethod
+    def _a5_mx_quant_v(cls, v: torch.Tensor, cu_seqlens_kv: torch.Tensor):
+        """MxFP8-quantize V (KV_T, N, D): per-request 32-token groups, per-D channel.
+
+        npu_dynamic_mx_quant (axis=0) already returns mxscale per segment in
+        the QFA TND v_descale layout (ceil(S_b/64), N, D, 2); per-request
+        segmentation satisfies the first-axis semantics (sum of per-batch
+        64-aligned groups). Returns fp8 data (KV_T, N, D) and e8m0 descale
+        (sum(ceil(S_b/64)), N, D, 2).
+        """
+        boundaries = cu_seqlens_kv.to(torch.int64).tolist()
+        n, d = v.shape[1], v.shape[2]
+        v8_parts, descale_parts = [], []
+        for b in range(len(boundaries) - 1):
+            seg_len = boundaries[b + 1] - boundaries[b]
+            if seg_len == 0:
+                continue
+            seg = v[boundaries[b] : boundaries[b + 1]]  # (S_b, N, D)
+            seg8, scale = torch_npu.npu_dynamic_mx_quant(seg, dst_type=torch.float8_e4m3fn, axis=0)
+            scale_u8 = cls._a5_scale_to_e8m0_u8(scale)
+            if scale_u8.dim() == 4:
+                # (ceil(S_b/64), N, D, 2) straight from the op.
+                descale_parts.append(scale_u8.contiguous())
+            elif scale_u8.dim() == 3:
+                # (groups, N, D): pair adjacent token groups along axis 0.
+                descale_parts.append(
+                    scale_u8.view(scale_u8.shape[0] // 2, 2, n, d).permute(0, 2, 3, 1).contiguous()
+                )
+            else:
+                # (D*N, groups) 2D fallback.
+                num_groups = scale_u8.shape[-1]
+                descale_parts.append(
+                    scale_u8.reshape(d, n, num_groups // 2, 2).permute(2, 1, 0, 3).contiguous()
+                )
+            v8_parts.append(seg8.contiguous())
+        descale = torch.cat(descale_parts, dim=0)
+        return torch.cat(v8_parts, dim=0), descale.view(torch_npu.float8_e8m0fnu)
 
     @staticmethod
     def _execute_kv_quant_sparse_flash_attention_vllm(
