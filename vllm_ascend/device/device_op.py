@@ -1087,6 +1087,12 @@ A5_ATTENTION_L2 = False
 # (V quantization reads seq lengths on host: tolist).
 A5_ATTENTION_QFA_GATHER = False
 
+# QFA quant_mode for the gather path. Set to 1 (MxFP8 + Softmax FP32) for
+# the B1 baseline, or 3 (MxFP8 + Softmax FP16, experimental, D=128 only)
+# for the B2 softmax-FP16 experiment. Only takes effect when
+# A5_ATTENTION_QFA_GATHER is True and A5_ATTENTION_IMPL is "QFA".
+A5_ATTENTION_QFA_MODE = 1
+
 # L2 MxFP8 cache constants.
 _L2_MX_GROUP_SIZE = 32
 _L2_MX_BLOCK_ALIGN = 64
@@ -1803,7 +1809,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             k8, k_descale = cls._a5_mx_quant_qk(key)
             v8, v_descale = cls._a5_mx_quant_v(value, cu_seqlens_kv)
         else:
-            # Decode / prefix-cache: gather K/V from BF16 paged cache.
+            # Decode / prefix-cache: gather K/V from paged cache.
             key_cache = kwargs.get("key_cache")
             value_cache = kwargs.get("value_cache")
             if key_cache is None or value_cache is None:
@@ -1818,10 +1824,14 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             # ---- GATHER: read each request's K/V blocks from the cache ----
             # This is the expensive O(seq_len) part: per-request loop +
             # block indexing + concatenation. The same history is re-gathered
-            # every step for every layer because the cache stays BF16.
+            # every step for every layer.
             k_parts = []
             v_parts = []
+            k_ds_parts = []
+            v_ds_parts = []
             kv_lens = []
+            cache_is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+
             for b in range(len(seq_lens_list)):
                 L = seq_lens_list[b]
                 if L == 0:
@@ -1833,28 +1843,58 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 v_req = value_cache[req_blocks].reshape(-1, num_key_value_heads, head_size)[:L]
                 k_parts.append(k_req)
                 v_parts.append(v_req)
+
+                if cache_is_fp8:
+                    # fp8 cache: also gather K/V descale from the L2 cache
+                    # tuple (accessed via the impl's _l2_kv_cache stash).
+                    l2_cache = kwargs.get("_l2_kv_cache") or getattr(attn_metadata, "_l2_kv_cache_local", None)
+                    if l2_cache is not None and len(l2_cache) >= 4:
+                        k_ds_cache, v_ds_cache = l2_cache[2], l2_cache[3]
+                        # K descale: per-token (Bn, Bs, N, ceil(D/64), 2) → gather rows
+                        k_ds_req = k_ds_cache[req_blocks].reshape(-1, *k_ds_cache.shape[2:])[:L]
+                        k_ds_parts.append(k_ds_req)
+                        # V descale: per-64-token (Bn, Bs//64, N, D, 2) → gather groups
+                        num_v_groups = (L + 63) // 64
+                        v_ds_req = v_ds_cache[req_blocks].reshape(-1, *v_ds_cache.shape[2:])[:num_v_groups]
+                        v_ds_parts.append(v_ds_req)
+
                 kv_lens.append(L)
 
             if not k_parts:
                 return None
-            k_gathered = torch.cat(k_parts, dim=0).contiguous()  # (KV_T, N, D) BF16
-            v_gathered = torch.cat(v_parts, dim=0).contiguous()  # (KV_T, N, D) BF16
+            k_gathered = torch.cat(k_parts, dim=0).contiguous()  # (KV_T, N, D)
+            v_gathered = torch.cat(v_parts, dim=0).contiguous()  # (KV_T, N, D)
 
             # Build cumulative KV lengths for QFA TND.
             cu_seqlens_kv = cls._a5_cu_seqlens(kv_lens, query.device)
 
-            # ---- ONLINE QUANTIZE: same math as prefill, but on gathered data ----
-            # This is O(seq_len) computation — re-done every step.
+            # Q: always quantized online (current step's projection, small)
             q8, q_descale = cls._a5_mx_quant_qk(query)
-            k8, k_descale = cls._a5_mx_quant_qk(k_gathered)
-            v8, v_descale = cls._a5_mx_quant_v(v_gathered, cu_seqlens_kv)
+
+            if cache_is_fp8 and k_ds_parts:
+                # fp8 cache: data is already quantized, descale already stored.
+                # No re-quantization — gather fp8 + descale → feed QFA directly.
+                k8 = k_gathered
+                k_descale = torch.cat(k_ds_parts, dim=0).contiguous()
+                # V descale: concatenate per-request 64-token groups
+                v8 = v_gathered
+                # v_descale from the cache is (sum_groups, N, D, 2) in PA layout;
+                # convert to TND v_descale format (sum_groups, N, D, 2)
+                v_descale = torch.cat(v_ds_parts, dim=0).contiguous()
+                # View as e8m0
+                k_descale = k_descale.view(torch_npu.float8_e8m0fnu) if k_descale.dtype == torch.uint8 else k_descale
+                v_descale = v_descale.view(torch_npu.float8_e8m0fnu) if v_descale.dtype == torch.uint8 else v_descale
+            else:
+                # BF16 cache: online quantize the gathered data (existing path).
+                k8, k_descale = cls._a5_mx_quant_qk(k_gathered)
+                v8, v_descale = cls._a5_mx_quant_v(v_gathered, cu_seqlens_kv)
 
         # ---- Feed QFA (TND mode, same for both prefill and gather paths) ----
         metadata = cann_ops.quant_flash_attn_metadata(
             num_heads,
             num_key_value_heads,
             head_size,
-            1,  # quant_mode=1: MxFP8 + softmax FP32
+            A5_ATTENTION_QFA_MODE,  # configurable: 1=FP32, 3=FP16 (experimental)
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             mask_mode=_A5_CAUSAL_MASK_MODE,
@@ -1870,7 +1910,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             q_descale,
             k_descale,
             v_descale,
-            1,  # quant_mode=1
+            A5_ATTENTION_QFA_MODE,  # configurable: 1=FP32, 3=FP16 (experimental)
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             attn_mask=attn_mask,
