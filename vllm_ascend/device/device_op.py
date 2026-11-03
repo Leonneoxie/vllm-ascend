@@ -1074,6 +1074,19 @@ A5_ATTENTION_GRAPH_BYPASS = False
 # =====================================================================
 A5_ATTENTION_L2 = False
 
+# Gather QFA switch (experimental, educational — covers ALL states without
+# changing the cache format). When True and A5_ATTENTION_IMPL == "QFA":
+# decode/prefix-cache batches gather K/V history from the BF16 paged cache
+# (using block_table), quantize online, and feed QFA in TND mode.
+# Fresh prefill uses the same online-quantization path as non-L2 QFA.
+#
+# WARNING: Performance-prohibitive for decode — O(seq_len) gather + quantize
+# per layer per step (the same K/V history is re-gathered and re-quantized
+# every step). Educational/reference implementation to demonstrate the
+# three QFA coverage approaches (non-L2 vs gather vs L2). Eager only
+# (V quantization reads seq lengths on host: tolist).
+A5_ATTENTION_QFA_GATHER = False
+
 # L2 MxFP8 cache constants.
 _L2_MX_GROUP_SIZE = 32
 _L2_MX_BLOCK_ALIGN = 64
@@ -1236,9 +1249,28 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 )
                 if l2_result is not None:
                     return l2_result
+            elif A5_ATTENTION_QFA_GATHER:
+                # Gather enabled: ALL states via gather from BF16 cache +
+                # online quantization. Covers decode without changing the
+                # cache format, but O(seq_len) gather + quantize per layer
+                # per step — educational, not for performance.
+                gather_result = cls._a5_quant_flash_attn_gather(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    num_heads=num_heads,
+                    num_key_value_heads=num_key_value_heads,
+                    head_size=head_size,
+                    scale=scale,
+                    **kwargs,
+                )
+                if gather_result is not None:
+                    return gather_result
             else:
                 # L2 disabled: prefill-only online quantization (decode
-                # falls back to FIA — BF16 cache cannot feed QFA).
+                # falls back to FIA — BF16 cache cannot feed QFA without
+                # either gather (expensive) or L2 cache format change).
                 qfa_result = cls._a5_quant_flash_attn(
                     query,
                     key,
@@ -1708,6 +1740,146 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             layout_q="TND",
             layout_q_descale="TND",
             layout_kv="PA_BBND",
+            layout_out="TND",
+            return_softmax_lse=False,
+        )
+        attn_out = result[0] if isinstance(result, tuple) else result
+        return attn_out, None
+
+    @classmethod
+    def _a5_quant_flash_attn_gather(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any,
+        *,
+        num_heads: int,
+        num_key_value_heads: int,
+        head_size: int,
+        scale: float,
+        **kwargs,
+    ):
+        """Gather + online quantize QFA: ALL states covered, BF16 cache unchanged.
+
+        This path demonstrates WHY the non-L2 QFA falls back for decode:
+        the KV cache stores BF16, QFA requires fp8+descale, and the only
+        way to bridge without changing the cache format is to gather the
+        per-request K/V history from the paged cache, quantize it online,
+        and feed QFA in TND mode — every step, every layer.
+
+        For fresh prefill (block_table is None): identical to non-L2 QFA
+        (online quantize, TND, no gather needed — K/V are in-memory tensors).
+
+        For decode/prefix-cache (block_table is not None):
+          1. Gather: read each request's K/V blocks from the BF16 paged cache
+             via block_table → concatenate into per-request contiguous tensors.
+             This is O(seq_len) memory copy per request per layer per step.
+          2. Quantize: npu_dynamic_mx_quant on the gathered K/V.
+             This is O(seq_len) computation — the same history is re-quantized
+             every step because the cache stays BF16.
+          3. Feed QFA in TND mode with cu_seqlens.
+
+        Performance: O(total_seq_len) gather + quantize per layer per step.
+        Compare with L2: O(1) per new token at write time, O(0) at attention
+        time (reads pre-quantized fp8 cache directly). Gather is roughly
+        100x slower for decode than L2. Educational/reference only.
+
+        Constraints: eager only (V quantization reads seq lengths on host
+        via tolist for per-request segmentation). Graph mode not supported.
+        """
+        cann_ops = cls._a5_import_cann_ops("QFA-GATHER")
+        block_table = kwargs.get("block_table")
+        cu_seqlens_q = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths"), query.device)
+        attn_mask = cls._a5_causal_mask_int8(kwargs.get("atten_mask"))
+        if attn_mask is None:
+            return None
+
+        if block_table is None:
+            # Fresh prefill: K/V are in-memory projection outputs (small).
+            # Same as non-L2 QFA — online quantize, TND, no gather needed.
+            cu_seqlens_kv = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths_kv"), query.device)
+            q8, q_descale = cls._a5_mx_quant_qk(query)
+            k8, k_descale = cls._a5_mx_quant_qk(key)
+            v8, v_descale = cls._a5_mx_quant_v(value, cu_seqlens_kv)
+        else:
+            # Decode / prefix-cache: gather K/V from BF16 paged cache.
+            key_cache = kwargs.get("key_cache")
+            value_cache = kwargs.get("value_cache")
+            if key_cache is None or value_cache is None:
+                return None
+
+            block_size = key_cache.shape[1]
+            seq_lens = attn_metadata.seq_lens
+            if seq_lens is None:
+                return None
+            seq_lens_list = seq_lens.cpu().tolist() if isinstance(seq_lens, torch.Tensor) else list(seq_lens)
+
+            # ---- GATHER: read each request's K/V blocks from the cache ----
+            # This is the expensive O(seq_len) part: per-request loop +
+            # block indexing + concatenation. The same history is re-gathered
+            # every step for every layer because the cache stays BF16.
+            k_parts = []
+            v_parts = []
+            kv_lens = []
+            for b in range(len(seq_lens_list)):
+                L = seq_lens_list[b]
+                if L == 0:
+                    continue
+                num_blocks = (L + block_size - 1) // block_size
+                req_blocks = block_table[b, :num_blocks].to(torch.long)
+                # Gather: (num_blocks, Bs, N, D) → (num_blocks*Bs, N, D) → [:L]
+                k_req = key_cache[req_blocks].reshape(-1, num_key_value_heads, head_size)[:L]
+                v_req = value_cache[req_blocks].reshape(-1, num_key_value_heads, head_size)[:L]
+                k_parts.append(k_req)
+                v_parts.append(v_req)
+                kv_lens.append(L)
+
+            if not k_parts:
+                return None
+            k_gathered = torch.cat(k_parts, dim=0).contiguous()  # (KV_T, N, D) BF16
+            v_gathered = torch.cat(v_parts, dim=0).contiguous()  # (KV_T, N, D) BF16
+
+            # Build cumulative KV lengths for QFA TND.
+            cu_seqlens_kv = cls._a5_cu_seqlens(kv_lens, query.device)
+
+            # ---- ONLINE QUANTIZE: same math as prefill, but on gathered data ----
+            # This is O(seq_len) computation — re-done every step.
+            q8, q_descale = cls._a5_mx_quant_qk(query)
+            k8, k_descale = cls._a5_mx_quant_qk(k_gathered)
+            v8, v_descale = cls._a5_mx_quant_v(v_gathered, cu_seqlens_kv)
+
+        # ---- Feed QFA (TND mode, same for both prefill and gather paths) ----
+        metadata = cann_ops.quant_flash_attn_metadata(
+            num_heads,
+            num_key_value_heads,
+            head_size,
+            1,  # quant_mode=1: MxFP8 + softmax FP32
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_q_descale="TND",
+            layout_kv="TND",
+            layout_out="TND",
+        )
+        result = cann_ops.quant_flash_attn(
+            q8,
+            k8,
+            v8,
+            q_descale,
+            k_descale,
+            v_descale,
+            1,  # quant_mode=1
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            attn_mask=attn_mask,
+            metadata=metadata,
+            softmax_scale=scale,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_q_descale="TND",
+            layout_kv="TND",
             layout_out="TND",
             return_softmax_lse=False,
         )
