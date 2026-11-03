@@ -1038,6 +1038,89 @@ class BaseDeviceAdaptor:
 # =====================================================================
 A5_ATTENTION_IMPL = "FIA"
 
+# Graph-capture bypass switch (experimental, stage 1 graph-mode support).
+# When True and A5_ATTENTION_IMPL == "FA", the attention capture path in
+# attention_v1.py (full_graph_fia / full_graph_fia_v2) is bypassed: the eager
+# FA path executes during capture so the generic NPU graph records the FA op
+# sequence, and graph replay then covers decode with FA. FA is graph-safe
+# this way because every per-step input is a stable-address device tensor
+# refreshed by the runner's persistent buffers. QFA is NOT bypassed: its V
+# quantization reads seq lengths on host (tolist), which would freeze at
+# capture-time values on replay and silently corrupt outputs.
+# Known verification item: _pad_query_start_loc_for_fia may append a
+# zero-length dummy request for the FIA TND num_reqs alignment; if FA rejects
+# zero-length requests the padding must be skipped for FA mode in the runner.
+A5_ATTENTION_GRAPH_BYPASS = False
+
+# =====================================================================
+# A5 L2: MxFP8 KV cache for wrapper-QFA full-path coverage (option B).
+#
+# Set A5_ATTENTION_IMPL = "QFA" AND A5_ATTENTION_L2 = True to enable the
+# MxFP8 KV cache (fp8 data + e8m0 descale buffers). Default False = BF16
+# cache, current behavior unchanged.
+#
+# Option B design (static V scale, no tail blocks):
+# - K descale: dynamic per-token (npu_dynamic_mx_quant at write time)
+# - V descale: static per-channel E8M0 (neutral default, broadcast-filled
+#   at cache allocation; no data dependency → no tail-block mechanism)
+# - V data: npu_quantize with static reciprocal scale (elementwise, no
+#   group dependency → each token independently quantized and scattered)
+# - Q: dynamic per-token (same as existing wrapper QFA branch)
+#
+# This approach mirrors the production C8-MXFP backend (attention_c8_mxfp.py)
+# but activates via the A5_ATTENTION_IMPL switch instead of quant products,
+# and sources V scales from a neutral default instead of checkpoint
+# calibration (w8a8-mxfp8 has no calibrated fa_v.scale).
+# =====================================================================
+A5_ATTENTION_L2 = False
+
+# L2 MxFP8 cache constants.
+_L2_MX_GROUP_SIZE = 32
+_L2_MX_BLOCK_ALIGN = 64
+_L2_MX_E4M3_EMAX = 8
+_L2_V_NEUTRAL_SCALE_EXPONENT = 0  # 2^0 = 1.0; covers typical V range (±448 for E4M3)
+
+
+def _l2_k_descale_shape(num_blocks: int, block_size: int, num_kv_heads: int, head_dim: int) -> tuple:
+    """Per-token K descale cache shape: (Bn, Bs, N, ceil(D/64), 2)."""
+    return (num_blocks, block_size, num_kv_heads, (head_dim + 63) // 64, 2)
+
+
+def _l2_v_descale_shape(num_blocks: int, block_size: int, num_kv_heads: int, head_dim: int) -> tuple:
+    """Per-64-token V descale cache shape: (Bn, Bs//64, N, D, 2)."""
+    return (num_blocks, block_size // 64, num_kv_heads, head_dim, 2)
+
+
+def _l2_neutral_v_scale_bytes(num_kv_heads: int, head_dim: int) -> torch.Tensor:
+    """E8M0 bytes for the neutral V descale: biased exponent for 2^exp."""
+    # E8M0: value = 2^(byte - 127); for scale = 2^0 = 1.0, byte = 127
+    return torch.full((num_kv_heads, head_dim, 2), 127 + _L2_V_NEUTRAL_SCALE_EXPONENT, dtype=torch.uint8)
+
+
+def l2_fill_v_descale_cache(v_descale_cache: torch.Tensor) -> None:
+    """Broadcast the neutral V scale over the entire descale cache.
+
+    Called once at cache allocation (and again when physical pages are
+    reassigned). The cache shape is (Bn, Bs//64, N, D, 2); the source is
+    (N, D, 2) — the block, token-group axes broadcast.
+    """
+    num_kv_heads = v_descale_cache.shape[2]
+    head_dim = v_descale_cache.shape[3]
+    neutral = _l2_neutral_v_scale_bytes(num_kv_heads, head_dim)
+    # Broadcast (N, D, 2) → (Bn, Bs//64, N, D, 2)
+    v_descale_cache.copy_(neutral.unsqueeze(0).unsqueeze(0))
+
+
+def _l2_v_scale_reciprocal(num_kv_heads: int, head_dim: int, device) -> torch.Tensor:
+    """Float32 reciprocal of the neutral V scale for npu_quantize.
+
+    npu_quantize divides by the scale; the neutral scale is 2^0 = 1.0,
+    so the reciprocal is also 1.0. Kept as a function for future
+    self-calibration upgrade (replace the neutral value with calibrated).
+    """
+    return torch.ones(num_kv_heads * head_dim, dtype=torch.float32, device=device)
+
+
 _A5_CAUSAL_MASK_MODE = 3  # mask_mode=CAUSAL for flash_attn / quant_flash_attn
 
 
@@ -1125,6 +1208,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 query,
                 key,
                 value,
+                attn_metadata,
                 key_cache=key_cache,
                 value_cache=value_cache,
                 num_heads=num_heads,
@@ -1136,18 +1220,37 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             if fa_result is not None:
                 return fa_result
         if A5_ATTENTION_IMPL == "QFA" and causal:
-            qfa_result = cls._a5_quant_flash_attn(
-                query,
-                key,
-                value,
-                num_heads=num_heads,
-                num_key_value_heads=num_key_value_heads,
-                head_size=head_size,
-                scale=scale,
-                **kwargs,
-            )
-            if qfa_result is not None:
-                return qfa_result
+            if A5_ATTENTION_L2:
+                # L2 enabled: unified path for ALL states (prefill + decode
+                # + prefix-cache all read from the MxFP8 paged cache).
+                l2_result = cls._a5_quant_flash_attn_l2(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    num_heads=num_heads,
+                    num_key_value_heads=num_key_value_heads,
+                    head_size=head_size,
+                    scale=scale,
+                    **kwargs,
+                )
+                if l2_result is not None:
+                    return l2_result
+            else:
+                # L2 disabled: prefill-only online quantization (decode
+                # falls back to FIA — BF16 cache cannot feed QFA).
+                qfa_result = cls._a5_quant_flash_attn(
+                    query,
+                    key,
+                    value,
+                    num_heads=num_heads,
+                    num_key_value_heads=num_key_value_heads,
+                    head_size=head_size,
+                    scale=scale,
+                    **kwargs,
+                )
+                if qfa_result is not None:
+                    return qfa_result
 
         if kwargs.get("block_table") is None:
             key = key.contiguous()
@@ -1169,6 +1272,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        attn_metadata: Any,
         *,
         key_cache: torch.Tensor | None,
         value_cache: torch.Tensor | None,
@@ -1183,6 +1287,10 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         Fresh prefill runs TND; decode / prefix-cache batches feed the KV
         cache directly as PA_BBND with block_table (no gather). Returns None
         to fall back to FIA when a paged batch has no cache tensors.
+        Graph-safe: seq_lens is sourced from the device tensor on
+        attn_metadata (refreshed in place by the runner's persistent buffer
+        on every replay) instead of the Python list, whose capture-time
+        values would silently freeze on replay.
         """
         cann_ops = cls._a5_import_cann_ops("FA")
 
@@ -1207,7 +1315,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 layout_kv = "PA_BBND"
                 kv = key_cache.view(key_cache.shape[0], key_cache.shape[1], num_key_value_heads, head_size)
                 vv = value_cache.view(value_cache.shape[0], value_cache.shape[1], num_key_value_heads, head_size)
-            seqused_kv = cls._a5_seqused(kwargs.get("actual_seq_lengths_kv"), query.device)
+            seqused_kv = cls._a5_seqused_from_metadata(attn_metadata, kwargs.get("actual_seq_lengths_kv"), query.device)
             cu_seqlens_kv = None
         else:
             layout_kv = "TND"
@@ -1348,6 +1456,21 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return torch.tensor(list(seq_lens), dtype=torch.int32, device=device)
 
     @staticmethod
+    def _a5_seqused_from_metadata(attn_metadata: Any, seq_lens_kwarg, device: torch.device) -> torch.Tensor:
+        """Per-request KV lengths for the PA path, graph-safely.
+
+        Prefers attn_metadata.seq_lens (a device tensor refreshed in place by
+        the runner every step) over the Python list that may arrive via
+        kwargs["actual_seq_lengths_kv"] (seq_lens_list): under graph capture
+        a tensor built from a Python list freezes at the capture-time values
+        and silently corrupts every replay.
+        """
+        seq_lens_dev = getattr(attn_metadata, "seq_lens", None)
+        if isinstance(seq_lens_dev, torch.Tensor):
+            return seq_lens_dev.to(torch.int32).flatten()
+        return A5DeviceAdaptor._a5_seqused(seq_lens_kwarg, device)
+
+    @staticmethod
     def _a5_causal_mask_int8(atten_mask):
         """Normalize the FIA causal mask to int8 (2048, 2048): nonzero=masked.
 
@@ -1435,6 +1558,161 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             v8_parts.append(seg8.contiguous())
         descale = torch.cat(descale_parts, dim=0)
         return torch.cat(v8_parts, dim=0), descale.view(torch_npu.float8_e8m0fnu)
+
+    # ===== L2: MxFP8 KV cache write path (option B, static V scale) =====
+
+    @classmethod
+    def _a5_l2_reshape_and_cache(
+        cls,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple,
+        attn_metadata: Any,
+        num_key_value_heads: int,
+    ):
+        """L2 write: quantize K dynamically + V statically, scatter all.
+
+        K: per-token MxFP8 (npu_dynamic_mx_quant, axis=-1) → scatter data
+        + per-token descale rows.
+        V: static per-channel scale (neutral default, broadcast-filled at
+        allocation) → npu_quantize elementwise → scatter data (descale
+        already filled, never changes). No tail blocks, no group state.
+        """
+        k_cache, v_cache, k_ds_cache, v_ds_cache = kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[3]
+        num_actual = key.shape[0]
+        slot_mapping = attn_metadata.slot_mapping[:num_actual]
+        block_size = k_cache.shape[1]
+        head_dim = k_cache.shape[3]
+
+        # K: dynamic per-token quantization
+        k8, k_scale = torch_npu.npu_dynamic_mx_quant(
+            key[:num_actual], dst_type=torch.float8_e4m3fn, axis=-1
+        )
+        # k_scale: (num_actual, N, ceil(D/64), 2) per-token → scatter rows
+
+        # V: static scale quantization (elementwise, no group dependency)
+        v_scale_recip = _l2_v_scale_reciprocal(num_key_value_heads, head_dim, key.device)
+        v_flat = value[:num_actual].view(num_actual, -1)
+        v8 = torch_npu.npu_quantize(
+            v_flat, v_scale_recip, None, torch.float8_e4m3fn, -1, False
+        ).view(num_actual, num_key_value_heads, head_dim)
+
+        # Scatter K/V data into the paged caches (int8 byte views; the
+        # scatter op accepts fp8 only on 950PR/DT, int8 writes identical
+        # bytes).
+        k8_bytes = k8.view(torch.int8)
+        v8_bytes = v8.view(torch.int8)
+        k_cache_bytes = k_cache.view(torch.int8)
+        v_cache_bytes = v_cache.view(torch.int8)
+        torch_npu.npu_scatter_pa_kv_cache(
+            key=k8_bytes,
+            value=v8_bytes,
+            key_cache=k_cache_bytes,
+            value_cache=v_cache_bytes,
+            slot_mapping=slot_mapping,
+            cache_mode="Norm",
+        )
+
+        # Scatter K descale rows: per-token (Bn, Bs, N, ceil(D/64), 2)
+        # slot → (block, offset) decomposition
+        safe_slots = slot_mapping.to(torch.long).clamp(min=0)
+        block_ids = safe_slots // block_size
+        offsets = safe_slots % block_size
+        # k_ds_cache[block, offset] = k_scale[token] — per-token row write
+        k_ds_flat = k_ds_cache.view(-1, *k_ds_cache.shape[2:])
+        k_ds_flat[safe_slots] = k_scale.view(num_actual, -1).to(torch.uint8)
+
+    # ===== L2: unified attention path (all states → PA + descale) =====
+
+    @classmethod
+    def _a5_quant_flash_attn_l2(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any,
+        *,
+        num_heads: int,
+        num_key_value_heads: int,
+        head_size: int,
+        scale: float,
+        **kwargs,
+    ):
+        """L2 unified QFA path: all attention states (prefill/decode/chunked)
+        read the MxFP8 paged cache directly via QFA PA layouts.
+
+        Requires the L2 cache tuple (k_fp8, v_fp8, k_ds, v_ds) — accessed
+        via getattr on the attention impl object (stashed in forward_impl
+        when the cache is a 4+ tuple). If not available, returns None.
+        Q is quantized online (the only remaining online quantization).
+        """
+        kv_cache = kwargs.get("_l2_kv_cache")
+        if kv_cache is None:
+            return None
+        cann_ops = cls._a5_import_cann_ops("QFA-L2")
+
+        k_cache, v_cache, k_ds, v_ds = kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[3]
+        block_table = kwargs.get("block_table")
+        cu_seqlens_q = cls._a5_cu_seqlens(kwargs.get("actual_seq_lengths"), query.device)
+        seqused_kv = cls._a5_seqused_from_metadata(attn_metadata, kwargs.get("actual_seq_lengths_kv"), query.device)
+        attn_mask = cls._a5_causal_mask_int8(kwargs.get("atten_mask"))
+        if attn_mask is None:
+            return None
+
+        # Q: dynamic per-token quantization (online, same as wrapper QFA)
+        q8, q_descale = cls._a5_mx_quant_qk(query)
+
+        # E8M0 views for QFA (uint8 storage → e8m0 dtype at call boundary)
+        k_ds_e8m0 = k_ds.view(torch_npu.float8_e8m0fnu)
+        v_ds_e8m0 = v_ds.view(torch_npu.float8_e8m0fnu)
+
+        # Cache tensors are PA_BBND: (Bn, Bs, N, D) → reshape to QFA's
+        # expected 5D NZ layout or use PA_BBND directly if supported.
+        # QFA layout_kv options: PA_BNBD / PA_BBND / PA_NZ.
+        # Our cache is (Bn, Bs, N, D) = PA_BBND.
+        # But QFA PA_BBND expects (Bn, Bs, KV_N, D) — matches.
+        # K descale cache: (Bn, Bs, N, ceil(D/64), 2) — QFA's PA_BBND
+        # descale layout for K is different; check QFA doc.
+        # For now, use TND-like descale reading (descale tensors are
+        # logical (N, ceil(D/64), 2) per token — QFA reads them from the
+        # cache directly with layout_kv=PA_BBND).
+
+        metadata = cann_ops.quant_flash_attn_metadata(
+            num_heads,
+            num_key_value_heads,
+            head_size,
+            1,  # quant_mode=1: MxFP8 + softmax FP32
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_q_descale="TND",
+            layout_kv="PA_BBND",
+            layout_out="TND",
+        )
+        result = cann_ops.quant_flash_attn(
+            q8,
+            k_cache,
+            v_cache,
+            q_descale,
+            k_ds_e8m0,
+            v_ds_e8m0,
+            1,  # quant_mode=1
+            block_table=block_table.to(torch.int32) if block_table is not None else None,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            attn_mask=attn_mask,
+            metadata=metadata,
+            softmax_scale=scale,
+            mask_mode=_A5_CAUSAL_MASK_MODE,
+            layout_q="TND",
+            layout_q_descale="TND",
+            layout_kv="PA_BBND",
+            layout_out="TND",
+            return_softmax_lse=False,
+        )
+        attn_out = result[0] if isinstance(result, tuple) else result
+        return attn_out, None
 
     @staticmethod
     def _execute_kv_quant_sparse_flash_attention_vllm(

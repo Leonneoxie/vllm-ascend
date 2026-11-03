@@ -127,6 +127,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
+from vllm_ascend.device.device_op import A5_ATTENTION_IMPL, A5_ATTENTION_L2
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
@@ -5506,6 +5507,37 @@ class NPUModelRunner(GPUModelRunner):
                     if not isinstance(raw, torch.Tensor):
                         raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(raw, current_kv_cache_spec, kernel_block_size)
+                    continue
+
+                # L2 MxFP8: wrapper-QFA cache allocation (A5_ATTENTION_L2).
+                # Allocates a (k_fp8, v_fp8, k_descale, v_descale) tuple with
+                # the V descale broadcast-filled at allocation.
+                if (
+                    A5_ATTENTION_L2
+                    and A5_ATTENTION_IMPL == "QFA"
+                    and isinstance(current_kv_cache_spec, FullAttentionSpec)
+                ):
+                    from vllm_ascend.device.device_op import (
+                        _l2_k_descale_shape,
+                        _l2_v_descale_shape,
+                        l2_fill_v_descale_cache,
+                    )
+
+                    num_blocks = kv_cache_config.num_blocks
+                    block_size = kernel_block_size
+                    n = current_kv_cache_spec.num_kv_heads
+                    d = current_kv_cache_spec.head_size
+                    device = self.device
+                    k_fp8 = torch.empty(
+                        (num_blocks, block_size, n, d), dtype=torch.float8_e4m3fn, device=device
+                    )
+                    v_fp8 = torch.empty(
+                        (num_blocks, block_size, n, d), dtype=torch.float8_e4m3fn, device=device
+                    )
+                    k_ds = torch.zeros(_l2_k_descale_shape(num_blocks, block_size, n, d), dtype=torch.uint8, device=device)
+                    v_ds = torch.zeros(_l2_v_descale_shape(num_blocks, block_size, n, d), dtype=torch.uint8, device=device)
+                    l2_fill_v_descale_cache(v_ds)
+                    kv_caches[layer_name] = (k_fp8, v_fp8, k_ds, v_ds)
                     continue
 
                 if layer_name in layer_tuple_strides:

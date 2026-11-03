@@ -61,7 +61,7 @@ from vllm_ascend.compilation.updatable_graph import (
     get_capture_resource,
     register_task,
 )
-from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.device_op import A5_ATTENTION_GRAPH_BYPASS, A5_ATTENTION_IMPL, A5_ATTENTION_L2, DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
 from vllm_ascend.utils import MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE, is_minimax_m3_fp8_kv_cache
@@ -885,7 +885,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
-            if self.sinks is not None:
+            if (
+                A5_ATTENTION_GRAPH_BYPASS
+                and A5_ATTENTION_IMPL == "FA"
+                and self.sinks is None
+                and self.sliding_window is None
+            ):
+                # Graph-capture bypass: let the eager FA path below execute
+                # during capture so the generic NPU graph records the FA op
+                # sequence (cu_seqlens build, mask cast, metadata op,
+                # flash_attn). Replay then covers decode with FA; inputs
+                # update through the runner's persistent buffers instead of
+                # the FIA graph-task machinery. QFA is NOT bypassed: its V
+                # quantization reads seq lengths on host (tolist), which would
+                # freeze at capture-time values on replay.
+                pass
+            elif self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
@@ -1007,6 +1022,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     scale=self.scale,
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
+                    _l2_kv_cache=getattr(self, "_l2_kv_cache", None),
                     current_key=key,
                     current_value=passed_value,
                     attn_metadata=attn_metadata,
@@ -1176,6 +1192,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ):
+        # L2 MxFP8 write path: quantize + scatter into the fp8/descale caches.
+        if (
+            A5_ATTENTION_L2
+            and A5_ATTENTION_IMPL == "QFA"
+            and kv_cache is not None
+            and len(kv_cache) >= 4
+        ):
+            DeviceOperator._a5_l2_reshape_and_cache(
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                num_key_value_heads=self.num_kv_heads,
+            )
+            return query, key, value, output
         if len(kv_cache) > 1:
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
@@ -1256,6 +1287,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         with attention_transfer_window():
             num_tokens = query.shape[0]
+
+            # L2: stash the full cache tuple on the impl so the wrapper
+            # dispatch (DeviceOperator) can pass it to the L2 attention path.
+            if A5_ATTENTION_L2 and A5_ATTENTION_IMPL == "QFA" and kv_cache is not None and len(kv_cache) >= 4:
+                self._l2_kv_cache = kv_cache
+            else:
+                self._l2_kv_cache = None
 
             if (
                 attn_metadata.attn_state == AscendAttentionState.DecodeOnly
