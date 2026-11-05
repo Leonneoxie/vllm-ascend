@@ -1923,42 +1923,188 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 k8, k_descale = cls._a5_mx_quant_qk(k_gathered)
                 v8, v_descale = cls._a5_mx_quant_v(v_gathered, cu_seqlens_kv)
 
-        # ---- Feed QFA (TND mode, same for both prefill and gather paths) ----
-        metadata = cann_ops.quant_flash_attn_metadata(
-            num_heads,
-            num_key_value_heads,
-            head_size,
-            A5_ATTENTION_QFA_MODE,  # configurable: 1=FP32, 3=FP16 (experimental)
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            mask_mode=_A5_CAUSAL_MASK_MODE,
-            layout_q="TND",
-            layout_q_descale="TND",
-            layout_kv="TND",
-            layout_out="TND",
-        )
-        result = cann_ops.quant_flash_attn(
-            q8,
-            k8,
-            v8,
-            q_descale,
-            k_descale,
-            v_descale,
-            A5_ATTENTION_QFA_MODE,  # configurable: 1=FP32, 3=FP16 (experimental)
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            attn_mask=attn_mask,
-            metadata=metadata,
-            softmax_scale=scale,
-            mask_mode=_A5_CAUSAL_MASK_MODE,
-            layout_q="TND",
-            layout_q_descale="TND",
-            layout_kv="TND",
-            layout_out="TND",
-            return_softmax_lse=False,
-        )
-        attn_out = result[0] if isinstance(result, tuple) else result
-        return attn_out, None
+        # ---- Feed QFA ----
+        # Mode 3 (FP16 experimental) only supports BNSD layout; convert
+        # TND → BNSD (batch-first, padded). Mode 1 (FP32) uses TND directly.
+        use_bnsd = A5_ATTENTION_QFA_MODE == 3
+
+        if use_bnsd:
+            # TND → BNSD conversion for mode 3 (BNSD-only kernel).
+            # For B=1 (recommended experiment config, single-request prefill /
+            # single-request decode), this is a simple permute with negligible
+            # overhead. For B>1, pad each request to max length.
+            #
+            # TND:  (T, N, D) — packed varlen
+            # BNSD: (B, N, S_max, D) — batch-first, padded
+            num_requests = len(cu_seqlens_q) - 1 if isinstance(cu_seqlens_q, torch.Tensor) else len(kv_lens)
+            if num_requests <= 0:
+                return None
+
+            # Split TND into per-request tensors and pad to max length
+            cu_q_list = cu_seqlens_q.cpu().tolist() if isinstance(cu_secalens_q := cu_seqlens_q, torch.Tensor) else list(cu_seqlens_q)
+            cu_kv_list = cu_seqlens_kv.cpu().tolist() if isinstance(cu_seqlens_kv, torch.Tensor) else list(cu_seqlens_kv)
+
+            max_q_len = max(cu_q_list[i + 1] - cu_q_list[i] for i in range(num_requests))
+            max_kv_len = max(cu_kv_list[i + 1] - cu_kv_list[i] for i in range(num_requests))
+
+            # Pad Q (and its descale) to BNSD
+            q_bnsd_parts = []
+            q_ds_bnsd_parts = []
+            for i in range(num_requests):
+                q_start, q_end = cu_q_list[i], cu_q_list[i + 1]
+                q_req = q8[q_start:q_end]  # (S_q, Q_N, D)
+                q_ds_req = q_descale[q_start:q_end]  # (S_q, Q_N, ceil(D/64), 2)
+                # Pad to max_q_len: (S_q, N, D) → (max_q_len, N, D)
+                if q_req.shape[0] < max_q_len:
+                    pad_q = torch.zeros(max_q_len - q_req.shape[0], *q_req.shape[1:], dtype=q_req.dtype, device=q_req.device)
+                    q_req = torch.cat([q_req, pad_q], dim=0)
+                    pad_q_ds = torch.zeros(max_q_len - q_ds_req.shape[0], *q_ds_req.shape[1:], dtype=q_ds_req.dtype, device=q_ds_req.device)
+                    q_ds_req = torch.cat([q_ds_req, pad_q_ds], dim=0)
+                # (S_max, Q_N, D) → permute to (Q_N, S_max, D) → unsqueeze(0)
+                q_bnsd_parts.append(q_req.permute(1, 0, 2).unsqueeze(0))
+                q_ds_bnsd_parts.append(q_ds_req.permute(1, 0, 2, 3).unsqueeze(0))
+
+            q_bnsd = torch.cat(q_bnsd_parts, dim=0).contiguous()  # (B, Q_N, S_max, D)
+            q_ds_bnsd = torch.cat(q_ds_bnsd_parts, dim=0).contiguous()  # (B, Q_N, S_max, ceil(D/64), 2)
+
+            # Pad K/V (and descale) to BNSD
+            k_bnsd_parts = []
+            v_bnsd_parts = []
+            k_ds_bnsd_parts = []
+            v_ds_bnsd_parts = []
+            seqused_q_list = []
+            seqused_kv_list = []
+            for i in range(num_requests):
+                kv_start, kv_end = cu_kv_list[i], cu_kv_list[i + 1]
+                kv_len = kv_end - kv_start
+                k_req = k8[kv_start:kv_end]  # (S_kv, KV_N, D)
+                v_req = v8[kv_start:kv_end]  # (S_kv, KV_N, D)
+                k_ds_req = k_descale[kv_start:kv_end]  # (S_kv, KV_N, ceil(D/64), 2)
+                # V descale: per-64-token groups; reshape to align with padding
+                num_v_groups_req = (kv_len + 63) // 64
+                v_ds_flat = v_descale.view(-1, *v_descale.shape[1:])  # (total_groups, N, D, 2)
+                v_ds_req = v_ds_flat[kv_start // 64 : kv_start // 64 + num_v_groups_req]
+
+                # Pad to max_kv_len
+                if kv_len < max_kv_len:
+                    pad_k = torch.zeros(max_kv_len - kv_len, *k_req.shape[1:], dtype=k_req.dtype, device=k_req.device)
+                    k_req = torch.cat([k_req, pad_k], dim=0)
+                    pad_v = torch.zeros(max_kv_len - kv_len, *v_req.shape[1:], dtype=v_req.dtype, device=v_req.device)
+                    v_req = torch.cat([v_req, pad_v], dim=0)
+                    pad_k_ds = torch.zeros(max_kv_len - kv_len, *k_ds_req.shape[1:], dtype=k_ds_req.dtype, device=k_ds_req.device)
+                    k_ds_req = torch.cat([k_ds_req, pad_k_ds], dim=0)
+                    max_v_groups = (max_kv_len + 63) // 64
+                    if num_v_groups_req < max_v_groups:
+                        pad_v_ds = torch.zeros(max_v_groups - num_v_groups_req, *v_ds_req.shape[1:], dtype=v_ds_req.dtype, device=v_ds_req.device)
+                        v_ds_req = torch.cat([v_ds_req, pad_v_ds], dim=0)
+
+                # (S_max, KV_N, D) → (KV_N, S_max, D) → unsqueeze(0)
+                k_bnsd_parts.append(k_req.permute(1, 0, 2).unsqueeze(0))
+                v_bnsd_parts.append(v_req.permute(1, 0, 2).unsqueeze(0))
+                k_ds_bnsd_parts.append(k_ds_req.permute(1, 0, 2, 3).unsqueeze(0))
+                v_ds_bnsd_parts.append(v_ds_req.permute(1, 0, 2, 3).unsqueeze(0))
+                seqused_q_list.append(cu_q_list[i + 1] - cu_q_list[i])
+                seqused_kv_list.append(kv_len)
+
+            k_bnsd = torch.cat(k_bnsd_parts, dim=0).contiguous()  # (B, KV_N, S_max, D)
+            v_bnsd = torch.cat(v_bnsd_parts, dim=0).contiguous()
+            k_ds_bnsd = torch.cat(k_ds_bnsd_parts, dim=0).contiguous()  # (B, KV_N, S_max, ceil(D/64), 2)
+            v_ds_bnsd = torch.cat(v_ds_bnsd_parts, dim=0).contiguous()  # (B, KV_N, ceil(S_max/64), D, 2)
+
+            # seqused tensors for BNSD (mask out padding)
+            seqused_q = torch.tensor(seqused_q_list, dtype=torch.int32, device=query.device)
+            seqused_kv = torch.tensor(seqused_kv_list, dtype=torch.int32, device=query.device)
+
+            # Build metadata for BNSD
+            metadata = cann_ops.quant_flash_attn_metadata(
+                num_heads,
+                num_key_value_heads,
+                head_size,
+                A5_ATTENTION_QFA_MODE,
+                cu_seqlens_q=None,
+                cu_seqlens_kv=None,
+                seqused_q=seqused_q,
+                seqused_kv=seqused_kv,
+                batch_size=num_requests,
+                max_seqlen_q=max_q_len,
+                max_seqlen_kv=max_kv_len,
+                mask_mode=_A5_CAUSAL_MASK_MODE,
+                layout_q="BNSD",
+                layout_q_descale="BNSD",
+                layout_kv="BNSD",
+                layout_out="BNSD",
+            )
+            result = cann_ops.quant_flash_attn(
+                q_bnsd,
+                k_bnsd,
+                v_bnsd,
+                q_ds_bnsd.view(torch_npu.float8_e8m0fnu) if q_ds_bnsd.dtype == torch.uint8 else q_ds_bnsd,
+                k_ds_bnsd.view(torch_npu.float8_e8m0fnu) if k_ds_bnsd.dtype == torch.uint8 else k_ds_bnsd,
+                v_ds_bnsd.view(torch_npu.float8_e8m0fnu) if v_ds_bnsd.dtype == torch.uint8 else v_ds_bnsd,
+                A5_ATTENTION_QFA_MODE,
+                seqused_q=seqused_q,
+                seqused_kv=seqused_kv,
+                batch_size=num_requests,
+                max_seqlen_q=max_q_len,
+                max_seqlen_kv=max_kv_len,
+                attn_mask=attn_mask,
+                metadata=metadata,
+                softmax_scale=scale,
+                mask_mode=_A5_CAUSAL_MASK_MODE,
+                layout_q="BNSD",
+                layout_q_descale="BNSD",
+                layout_kv="BNSD",
+                layout_out="BNSD",
+                return_softmax_lse=False,
+            )
+            attn_out = result[0] if isinstance(result, tuple) else result
+            # BNSD output: (B, Q_N, S_max, D) → extract valid tokens → (T, Q_N, D)
+            attn_out_tnd_parts = []
+            for i in range(num_requests):
+                q_start, q_end = cu_q_list[i], cu_q_list[i + 1]
+                # BNSD: (B, Q_N, S_max, D) → (Q_N, S_max, D) → (S_max, Q_N, D) → [:S_q]
+                out_req = attn_out[i].permute(1, 0, 2)[: q_end - q_start]
+                attn_out_tnd_parts.append(out_req)
+            attn_out = torch.cat(attn_out_tnd_parts, dim=0).contiguous()
+            return attn_out, None
+
+        else:
+            # Mode 1 (FP32): TND layout directly (mainline QFA supports TND)
+            metadata = cann_ops.quant_flash_attn_metadata(
+                num_heads,
+                num_key_value_heads,
+                head_size,
+                A5_ATTENTION_QFA_MODE,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                mask_mode=_A5_CAUSAL_MASK_MODE,
+                layout_q="TND",
+                layout_q_descale="TND",
+                layout_kv="TND",
+                layout_out="TND",
+            )
+            result = cann_ops.quant_flash_attn(
+                q8,
+                k8,
+                v8,
+                q_descale,
+                k_descale,
+                v_descale,
+                A5_ATTENTION_QFA_MODE,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                attn_mask=attn_mask,
+                metadata=metadata,
+                softmax_scale=scale,
+                mask_mode=_A5_CAUSAL_MASK_MODE,
+                layout_q="TND",
+                layout_q_descale="TND",
+                layout_kv="TND",
+                layout_out="TND",
+                return_softmax_lse=False,
+            )
+            attn_out = result[0] if isinstance(result, tuple) else result
+            return attn_out, None
 
     @staticmethod
     def _execute_kv_quant_sparse_flash_attention_vllm(
