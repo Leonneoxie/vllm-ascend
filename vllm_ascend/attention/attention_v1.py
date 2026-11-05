@@ -61,7 +61,7 @@ from vllm_ascend.compilation.updatable_graph import (
     get_capture_resource,
     register_task,
 )
-from vllm_ascend.device.device_op import A5_ATTENTION_GRAPH_BYPASS, A5_ATTENTION_IMPL, A5_ATTENTION_L2, DeviceOperator
+from vllm_ascend.device.device_op import A5_ATTENTION_FA_DECODE, A5_ATTENTION_GRAPH_BYPASS, A5_ATTENTION_IMPL, A5_ATTENTION_L2, DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
 from vllm_ascend.utils import MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE, is_minimax_m3_fp8_kv_cache
@@ -887,7 +887,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if _EXTRA_CTX.capturing:
             if (
                 A5_ATTENTION_GRAPH_BYPASS
-                and A5_ATTENTION_IMPL == "FA"
+                and (
+                    A5_ATTENTION_IMPL == "FA"
+                    or (A5_ATTENTION_IMPL == "QFA" and A5_ATTENTION_FA_DECODE)
+                )
                 and self.sinks is None
                 and self.sliding_window is None
             ):
@@ -896,9 +899,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # sequence (cu_seqlens build, mask cast, metadata op,
                 # flash_attn). Replay then covers decode with FA; inputs
                 # update through the runner's persistent buffers instead of
-                # the FIA graph-task machinery. QFA is NOT bypassed: its V
-                # quantization reads seq lengths on host (tolist), which would
-                # freeze at capture-time values on replay.
+                # the FIA graph-task machinery.
+                #
+                # For A5_ATTENTION_IMPL == "QFA" + A5_ATTENTION_FA_DECODE:
+                # during graph capture (decode states only in FULL_DECODE_ONLY),
+                # the QFA prefill path returns None immediately (block_table
+                # is not None → no tolist executed), then FA takes over and
+                # is recorded. Prefill runs eagerly (QFA tolist is safe in
+                # eager). QFA without FA_DECODE is NOT bypassed: its V
+                # quantization reads seq lengths on host (tolist), which
+                # would freeze at capture-time values on replay.
                 pass
             elif self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)

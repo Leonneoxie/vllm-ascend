@@ -1093,6 +1093,17 @@ A5_ATTENTION_QFA_GATHER = False
 # A5_ATTENTION_QFA_GATHER is True and A5_ATTENTION_IMPL is "QFA".
 A5_ATTENTION_QFA_MODE = 1
 
+# QFA prefill + FA decode hybrid switch. When True and
+# A5_ATTENTION_IMPL == "QFA" (and L2/gather are both off):
+#   - Prefill (block_table is None): QFA online quantization (TND/BNSD)
+#   - Decode/prefix-cache (block_table is not None): FA (BF16, PA_BBND)
+# QFA prefill returns None for decode states → FA takes over instead of
+# falling through to FIA. Graph-safe for FULL_DECODE_ONLY: during capture,
+# QFA returns None immediately for decode (no tolist executed), then FA
+# ops are recorded in the graph. During replay, FA replays from persistent
+# buffers. Prefill runs eagerly (QFA with tolist is safe in eager).
+A5_ATTENTION_FA_DECODE = False
+
 # L2 MxFP8 cache constants.
 _L2_MX_GROUP_SIZE = 32
 _L2_MX_BLOCK_ALIGN = 64
@@ -1275,8 +1286,9 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     return gather_result
             else:
                 # L2 disabled: prefill-only online quantization (decode
-                # falls back to FIA — BF16 cache cannot feed QFA without
-                # either gather (expensive) or L2 cache format change).
+                # falls back to FA_DECODE or FIA — BF16 cache cannot feed
+                # QFA without either gather (expensive) or L2 cache format
+                # change).
                 qfa_result = cls._a5_quant_flash_attn(
                     query,
                     key,
@@ -1289,6 +1301,28 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 )
                 if qfa_result is not None:
                     return qfa_result
+                if A5_ATTENTION_FA_DECODE:
+                    # QFA prefill returned None (decode/prefix-cache state):
+                    # fall back to FA (BF16, PA_BBND) instead of FIA.
+                    # Graph-safe: FA reads seq_lens from the device tensor
+                    # (attn_metadata.seq_lens), and QFA's tolist is never
+                    # reached for decode states (returns None immediately
+                    # on block_table is not None).
+                    fa_result = cls._a5_flash_attn(
+                        query,
+                        key,
+                        value,
+                        attn_metadata,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        num_heads=num_heads,
+                        num_key_value_heads=num_key_value_heads,
+                        head_size=head_size,
+                        scale=scale,
+                        **kwargs,
+                    )
+                    if fa_result is not None:
+                        return fa_result
 
         if kwargs.get("block_table") is None:
             key = key.contiguous()
